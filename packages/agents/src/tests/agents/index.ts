@@ -4,7 +4,8 @@ export {
   TestAddMcpServerAgent,
   TestRpcMcpClientAgent,
   TestHttpMcpDedupAgent,
-  TestConnectionUriAgent
+  TestConnectionUriAgent,
+  TestMcpSettlementAgent
 } from "./mcp";
 export {
   TestEmailAgent,

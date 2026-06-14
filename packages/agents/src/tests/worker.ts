@@ -13,6 +13,7 @@ export {
   TestAddMcpServerAgent,
   TestRpcMcpClientAgent,
   TestHttpMcpDedupAgent,
+  TestMcpSettlementAgent,
   TestEmailAgent,
   TestCaseSensitiveAgent,
   TestUserNotificationAgent,
@@ -108,6 +109,7 @@ import type {
   TestAgentToolReplayAgent,
   TestAddMcpServerAgent,
   TestHttpMcpDedupAgent,
+  TestMcpSettlementAgent,
   TestStateAgent,
   TestStateAgentNoInitial,
   TestThrowingStateAgent,
@@ -159,6 +161,7 @@ export type Env = {
   TestAddMcpServerAgent: DurableObjectNamespace<TestAddMcpServerAgent>;
   TestRpcMcpClientAgent: DurableObjectNamespace<TestRpcMcpClientAgent>;
   TestHttpMcpDedupAgent: DurableObjectNamespace<TestHttpMcpDedupAgent>;
+  TestMcpSettlementAgent: DurableObjectNamespace<TestMcpSettlementAgent>;
   TestStateAgent: DurableObjectNamespace<TestStateAgent>;
   TestStateAgentNoInitial: DurableObjectNamespace<TestStateAgentNoInitial>;
   TestThrowingStateAgent: DurableObjectNamespace<TestThrowingStateAgent>;

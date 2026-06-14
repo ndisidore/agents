@@ -2497,10 +2497,12 @@ describe("MCPClientManager OAuth Integration", () => {
       expect(waited).toBe(true);
     });
 
-    it("should fire onServerStateChanged when removing a server", async () => {
+    it("signals removal via onServerRemoved AND a terminal onServerStateChanged", async () => {
       const id = "remove-server";
       const onStateChangedSpy = vi.fn();
+      const onRemovedSpy = vi.fn();
       manager.onServerStateChanged(onStateChangedSpy);
+      manager.onServerRemoved(onRemovedSpy);
 
       await manager.registerServer(id, {
         url: "http://example.com/mcp",
@@ -2515,8 +2517,79 @@ describe("MCPClientManager OAuth Integration", () => {
 
       await manager.removeServer(id);
 
-      // Should fire when server is removed
+      // Removal fires the canonical onServerRemoved...
+      expect(onRemovedSpy).toHaveBeenCalledTimes(1);
+      expect(onRemovedSpy).toHaveBeenCalledWith({
+        serverId: id,
+        url: "http://example.com/mcp"
+      });
+      // ...AND a terminal onServerStateChanged with the `"removed"` sentinel, so
+      // subscribers that only watch state changes still observe the deletion.
       expect(onStateChangedSpy).toHaveBeenCalledTimes(1);
+      const change = onStateChangedSpy.mock.calls[0][0];
+      expect(change.serverId).toBe(id);
+      expect(change.state).toBe("removed");
+      expect(change.url).toBe("http://example.com/mcp");
+    });
+
+    it("should emit a server-scoped payload on onServerStateChanged", async () => {
+      const id = "payload-server";
+      const onStateChangedSpy = vi.fn();
+      manager.onServerStateChanged(onStateChangedSpy);
+
+      await manager.registerServer(id, {
+        url: "http://example.com/mcp",
+        name: "Payload Server",
+        callbackUrl: "http://localhost:3000/callback",
+        client: {},
+        transport: { type: "auto" }
+      });
+
+      expect(onStateChangedSpy).toHaveBeenCalledTimes(1);
+      const payload = onStateChangedSpy.mock.calls[0][0];
+      expect(payload).toMatchObject({
+        serverId: id,
+        url: "http://example.com/mcp"
+      });
+      expect(payload.state).toBeTruthy();
+
+      // getServerStateChange exposes the same payload on demand
+      expect(manager.getServerStateChange(id)).toMatchObject({
+        serverId: id,
+        url: "http://example.com/mcp"
+      });
+    });
+
+    it("fires onServerRemoved after storage removal, carrying the last-known url", async () => {
+      const id = "removed-payload-server";
+      const url = "http://example.com/mcp";
+      await manager.registerServer(id, {
+        url,
+        name: "Removed Server",
+        callbackUrl: "http://localhost:3000/callback",
+        client: {},
+        transport: { type: "auto" }
+      });
+
+      const removals: Array<{ serverId: string; url: string }> = [];
+      manager.onServerRemoved((removal) => {
+        // The event fires *after* the storage row is deleted: any broadcast
+        // subscriber that re-reads storage from this handler must observe the
+        // deletion (not a stale snapshot that still lists the removed server).
+        const stillPresent = manager
+          .listServers()
+          .some((s) => s.id === removal.serverId);
+        expect(stillPresent).toBe(false);
+        // The last-known url still rides in the payload so URL-targeted
+        // matchers can resolve against the server that just went away.
+        removals.push(removal);
+      });
+
+      await manager.removeServer(id);
+
+      expect(removals).toEqual([{ serverId: id, url }]);
+      // And the row is gone afterwards.
+      expect(manager.listServers().some((s) => s.id === id)).toBe(false);
     });
   });
 
@@ -3869,6 +3942,17 @@ describe("MCPClientManager OAuth Integration", () => {
       });
 
       manager.mcpConnections[serverId] = connection;
+      // A registered server always has a stored row; seed it so the
+      // server-scoped onServerStateChanged payload resolves.
+      saveServerToMock({
+        id: serverId,
+        name: "test",
+        server_url: "http://test.com/",
+        client_id: null,
+        auth_url: null,
+        callback_url: "",
+        server_options: null
+      });
 
       // Set up event piping from connection to manager (normally done by createConnection)
       connection.onObservabilityEvent((event) => {

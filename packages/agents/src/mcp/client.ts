@@ -16,7 +16,13 @@ import { type RetryOptions, tryN } from "../retries";
 import type { ToolSet } from "ai";
 import { z } from "zod";
 import { nanoid } from "nanoid";
-import { Emitter, type Event, DisposableStore } from "../core/events";
+import {
+  Emitter,
+  type Event,
+  DisposableStore,
+  type Disposable,
+  toDisposable
+} from "../core/events";
 import type { MCPObservabilityEvent } from "../observability/mcp";
 import {
   MCPClientConnection,
@@ -26,7 +32,7 @@ import {
 import { toErrorMessage } from "./errors";
 import { RPC_DO_PREFIX } from "./rpc";
 import type { TransportType } from "./types";
-import type { MCPServerRow } from "./client-storage";
+import type { MCPServerRow, MCPServerStateRow } from "./client-storage";
 import type { AgentMcpOAuthProvider } from "./do-oauth-client-provider";
 import { DurableObjectOAuthClientProvider } from "./do-oauth-client-provider";
 
@@ -36,6 +42,16 @@ const defaultClientOptions: ConstructorParameters<typeof Client>[1] = {
 
 /** Maximum length of a normalized MCP server id. */
 export const MCP_SERVER_ID_MAX_LENGTH = 64;
+
+/**
+ * How long an orphan server-state tombstone (a removed-and-not-re-added server)
+ * is retained before it is pruned on wake. The tombstone exists solely to keep
+ * the `version` cursor monotonic across a remove + re-add of the same id; once
+ * a removal is this old, any cross-DO consumer tracking the pre-removal cursor
+ * is assumed to have reconciled the server's disappearance, so the row can be
+ * reclaimed to bound table growth. Conservative by design.
+ */
+const MCP_SERVER_STATE_TOMBSTONE_TTL_MS = 24 * 60 * 60 * 1000;
 
 /**
  * Normalize a caller-supplied MCP server id into a stable, storage- and
@@ -276,6 +292,72 @@ export type MCPDiscoverResult = {
   error?: string;
 };
 
+/**
+ * Payload describing a single MCP server's current connection state, emitted by
+ * {@link MCPClientManager.onServerStateChanged} when that server changes.
+ *
+ * `version` is the per-server monotonic counter that also lands in the durable
+ * store (see {@link MCPClientManager.getPersistedServerState}), so an awake
+ * subscriber and a hibernating consumer that polls on wake share one cursor.
+ * Note the live event may repeat a `version` on a no-op notification, so
+ * consumers should treat the cursor as monotonic-non-decreasing and dedupe by
+ * `version` on the event path too.
+ */
+export type MCPServerStateChange = {
+  serverId: string;
+  url: string;
+  /**
+   * The server's current connection state, or the terminal sentinel
+   * `"removed"` emitted once when the server is removed — so subscribers that
+   * only watch `onServerStateChanged` (the pre-`onServerRemoved` contract)
+   * still observe deletion. `"removed"` is intentionally *not* a member of
+   * {@link MCPConnectionState}: it is a server-lifecycle fact, not a connection
+   * state, and lives on this event payload alone (it never appears on a live
+   * connection, the durable snapshot, or a settlement target). The canonical,
+   * structured removal signal remains {@link MCPClientManager.onServerRemoved}.
+   * See `design/rfc-mcp-settlement-extraction.md` for the rationale and the
+   * alternatives considered.
+   */
+  state: MCPConnectionState | "removed";
+  error?: string;
+  version: number;
+};
+
+/**
+ * Durable, pollable snapshot of a server's last-known connection state. Written
+ * on every transition and readable without a live transport probe — the
+ * enabler for a hibernating consumer DO to reconcile on wake (cross-DO fan-out
+ * stays an app-level concern).
+ */
+export type MCPServerStateSnapshot = {
+  serverId: string;
+  url: string;
+  state: MCPConnectionState | null;
+  error?: string;
+  version: number;
+};
+
+/**
+ * Payload emitted by {@link MCPClientManager.onServerRemoved} immediately
+ * *before* the server's storage row is deleted, so subscribers can still
+ * resolve URL-targeted matches against the server that is going away.
+ */
+export type MCPServerRemoval = {
+  serverId: string;
+  url: string;
+};
+
+/**
+ * Payload emitted by {@link MCPClientManager.onServerIdMigrated} after a
+ * server's id is renamed (in storage and in memory). Subscribers that key
+ * durable state by serverId (e.g. settlement watches) re-target from `oldId`
+ * to `newId` so a watch registered against the old id is not stranded.
+ */
+export type MCPServerIdMigration = {
+  oldId: string;
+  newId: string;
+};
+
 export type MCPClientOAuthCallbackConfig = {
   successRedirect?: string;
   errorRedirect?: string;
@@ -323,6 +405,7 @@ export class MCPClientManager {
   ) => AgentMcpOAuthProvider;
   private _isRestored = false;
   private _pendingConnections = new Map<string, Promise<void>>();
+  private _serverStateTableReady = false;
 
   /** @internal Protected for testing purposes. */
   protected readonly _onObservabilityEvent =
@@ -330,13 +413,49 @@ export class MCPClientManager {
   public readonly onObservabilityEvent: Event<MCPObservabilityEvent> =
     this._onObservabilityEvent.event;
 
-  private readonly _onServerStateChanged = new Emitter<void>();
+  private readonly _onServerStateChanged = new Emitter<MCPServerStateChange>();
   /**
-   * Event that fires whenever any MCP server state changes (registered, connected, removed, etc.)
-   * This is useful for broadcasting server state to clients.
+   * Fires whenever a single MCP server's connection state changes, carrying an
+   * {@link MCPServerStateChange} payload (including the monotonic `version`).
+   * Server *removal* is signalled separately via {@link onServerRemoved}, so
+   * this event always carries a resolvable per-server payload.
    */
-  public readonly onServerStateChanged: Event<void> =
+  public readonly onServerStateChanged: Event<MCPServerStateChange> =
     this._onServerStateChanged.event;
+
+  private readonly _onServerRemoved = new Emitter<MCPServerRemoval>();
+  /**
+   * Event that fires immediately *before* a server's storage row is removed.
+   * Carries the last-known `{ serverId, url }` so subscribers (e.g. durable
+   * settlement watches) can resolve URL-targeted matches against the server
+   * that is being removed.
+   */
+  public readonly onServerRemoved: Event<MCPServerRemoval> =
+    this._onServerRemoved.event;
+
+  private readonly _onServerIdMigrated = new Emitter<MCPServerIdMigration>();
+  /**
+   * Fires after {@link migrateServerId} renames a server (storage + memory),
+   * *before* the post-migration state notification. Carries `{ oldId, newId }`
+   * so serverId-keyed subscribers can follow the rename rather than stranding
+   * durable state under the old id.
+   */
+  public readonly onServerIdMigrated: Event<MCPServerIdMigration> =
+    this._onServerIdMigrated.event;
+
+  /**
+   * Hooks run by the owning Agent on every wake, *after* all MCP connections
+   * are restored (HTTP/OAuth via {@link restoreConnectionsFromStorage} and RPC
+   * MCP via the Agent) and before the user's `onStart()`. This is the
+   * MCP-subsystem-local seam durable subsystems (e.g. the experimental
+   * settlement mixin) use to re-derive state on wake. It is *awaited* — wake
+   * recovery is the durable driver (deadline re-arm / at-least-once
+   * redelivery), not an opportunistic signal — so it must not degrade to a
+   * fire-and-forget event.
+   *
+   * @internal
+   */
+  private _postRestoreHooks: Array<() => void | Promise<void>> = [];
 
   /**
    * @param _name Name of the MCP client
@@ -363,6 +482,259 @@ export class MCPClientManager {
     ...bindings: SqlStorageValue[]
   ): T[] {
     return [...this._storage.sql.exec<T>(query, ...bindings)];
+  }
+
+  /**
+   * Single chokepoint for server state-change notifications. Every place that
+   * mutates a server's connection state funnels through here so subscribers
+   * (client broadcasts, durable settlement watches) observe a consistent,
+   * payload-bearing signal.
+   *
+   * Pass the affected `serverId`; the durable snapshot is persisted first, then
+   * an {@link MCPServerStateChange} is emitted (skipped only if the server has
+   * no resolvable state, which never happens for a registered server).
+   * Removal is signalled via {@link onServerRemoved}, not here.
+   */
+  private _notifyServerStateChanged(serverId: string): void {
+    // Persist the durable state snapshot *before* emitting, so an awake
+    // subscriber and the next poll-on-wake reader observe the same version.
+    this._persistServerState(serverId);
+    const change = this.getServerStateChange(serverId);
+    if (change) this._onServerStateChanged.fire(change);
+  }
+
+  /**
+   * Register a hook invoked after MCP restore on every wake (see
+   * {@link _postRestoreHooks}). Returns a {@link Disposable} that unregisters
+   * it.
+   *
+   * @internal
+   */
+  registerPostRestoreHook(fn: () => void | Promise<void>): Disposable {
+    this._postRestoreHooks.push(fn);
+    return toDisposable(() => {
+      const index = this._postRestoreHooks.indexOf(fn);
+      if (index !== -1) this._postRestoreHooks.splice(index, 1);
+    });
+  }
+
+  /**
+   * Run all registered post-restore hooks, each isolated so one failing hook
+   * cannot abort the others or the wake path. Invoked by the owning Agent
+   * after both HTTP/OAuth and RPC MCP restore complete.
+   *
+   * @internal
+   */
+  async _runPostRestoreHooks(): Promise<void> {
+    for (const hook of this._postRestoreHooks) {
+      try {
+        await hook();
+      } catch (error) {
+        console.error("[MCPClientManager] post-restore hook failed:", error);
+      }
+    }
+  }
+
+  /**
+   * Resolve a server's current connection state: the live connection state if
+   * present, else `AUTHENTICATING` when an OAuth `auth_url` is pending (covers
+   * the post-restore window before the connection is re-established), else
+   * `null`.
+   */
+  private _resolveServerState(server: MCPServerRow): MCPConnectionState | null {
+    const conn = this.mcpConnections[server.id];
+    if (conn?.connectionState) return conn.connectionState;
+    if (server.auth_url) return MCPConnectionState.AUTHENTICATING;
+    return null;
+  }
+
+  /**
+   * Build the current {@link MCPServerStateChange} payload for a server, or
+   * `undefined` if the server is unknown or has no resolvable state at all.
+   */
+  getServerStateChange(serverId: string): MCPServerStateChange | undefined {
+    const server = this.getServersFromStorage().find((s) => s.id === serverId);
+    if (!server) return undefined;
+
+    const state = this._resolveServerState(server);
+    if (!state) return undefined;
+
+    const conn = this.mcpConnections[serverId];
+    return {
+      error: conn?.connectionError ?? undefined,
+      serverId,
+      state,
+      url: server.server_url,
+      version: this._getServerStateRow(serverId)?.version ?? 0
+    };
+  }
+
+  /**
+   * Lazily create the durable per-server connection-state table. Kept separate
+   * from `cf_agents_mcp_servers` so the monotonic `version` survives the
+   * `INSERT OR REPLACE` rewrites of the config row, and so no core schema
+   * migration is forced on agents that never use MCP.
+   */
+  private _ensureServerStateTable(): void {
+    if (this._serverStateTableReady) return;
+    this.sql(
+      `CREATE TABLE IF NOT EXISTS cf_agents_mcp_server_state (
+        server_id TEXT PRIMARY KEY NOT NULL,
+        state TEXT,
+        error TEXT,
+        version INTEGER NOT NULL DEFAULT 0,
+        updated_at INTEGER NOT NULL
+      )`
+    );
+    this._serverStateTableReady = true;
+  }
+
+  private _getServerStateRow(serverId: string): MCPServerStateRow | undefined {
+    this._ensureServerStateTable();
+    return this.sql<MCPServerStateRow>(
+      `SELECT server_id, state, error, version, updated_at
+       FROM cf_agents_mcp_server_state WHERE server_id = ?`,
+      serverId
+    )[0];
+  }
+
+  /**
+   * Record the server's current connection state, bumping `version` only when
+   * the state or error actually changes (so the counter is a meaningful
+   * "did it change" cursor rather than inflating on no-op notifications).
+   */
+  private _persistServerState(serverId: string): void {
+    this._ensureServerStateTable();
+
+    // If the config row is gone, don't resurrect an orphan state row.
+    const server = this.getServersFromStorage().find((s) => s.id === serverId);
+    if (!server) return;
+
+    const state = this._resolveServerState(server);
+    const conn = this.mcpConnections[serverId];
+    const error = conn?.connectionError ?? null;
+
+    const existing = this._getServerStateRow(serverId);
+    if (existing && existing.state === state && existing.error === error) {
+      return;
+    }
+
+    const version = (existing?.version ?? 0) + 1;
+    this.sql(
+      `INSERT INTO cf_agents_mcp_server_state
+         (server_id, state, error, version, updated_at)
+       VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(server_id) DO UPDATE SET
+         state = excluded.state,
+         error = excluded.error,
+         version = excluded.version,
+         updated_at = excluded.updated_at`,
+      serverId,
+      state,
+      error,
+      version,
+      Date.now()
+    );
+  }
+
+  /**
+   * Tombstone a server's state on removal: keep the row with the `version`
+   * bumped and `state`/`error` cleared. Preserves monotonicity if the same
+   * stable id is re-added later (a re-add resumes from `version + 1` rather
+   * than resetting to 1 and stalling a `version`-cursor consumer).
+   */
+  private _tombstoneServerState(serverId: string): void {
+    this._ensureServerStateTable();
+    const existing = this._getServerStateRow(serverId);
+    const version = (existing?.version ?? 0) + 1;
+    this.sql(
+      `INSERT INTO cf_agents_mcp_server_state
+         (server_id, state, error, version, updated_at)
+       VALUES (?, NULL, NULL, ?, ?)
+       ON CONFLICT(server_id) DO UPDATE SET
+         state = NULL, error = NULL, version = excluded.version,
+         updated_at = excluded.updated_at`,
+      serverId,
+      version,
+      Date.now()
+    );
+  }
+
+  /** True if the durable snapshot table has been created at least once. */
+  private _serverStateTableExists(): boolean {
+    if (this._serverStateTableReady) return true;
+    return (
+      this.sql<{ name: string }>(
+        `SELECT name FROM sqlite_master
+         WHERE type = 'table' AND name = 'cf_agents_mcp_server_state'`
+      ).length > 0
+    );
+  }
+
+  /**
+   * Reclaim orphan tombstones — rows for a server that no longer exists in
+   * `cf_agents_mcp_servers` and was tombstoned more than `olderThanMs` ago — so
+   * the snapshot table can't grow unbounded across a DO's lifetime as servers
+   * are added and removed. Live rows and recent tombstones (still within the
+   * `version`-cursor safety window) are left untouched. Runs on wake; cheap
+   * no-op if the table was never created.
+   */
+  pruneServerStateTombstones(
+    olderThanMs = MCP_SERVER_STATE_TOMBSTONE_TTL_MS
+  ): void {
+    if (!this._serverStateTableExists()) return;
+    this._ensureServerStateTable();
+    this.sql(
+      `DELETE FROM cf_agents_mcp_server_state
+       WHERE state IS NULL
+         AND updated_at < ?
+         AND server_id NOT IN (SELECT id FROM cf_agents_mcp_servers)`,
+      Date.now() - olderThanMs
+    );
+  }
+
+  /**
+   * Durable, pollable snapshot of a server's last-known connection state.
+   * Readable without a live transport probe — the enabler for a hibernating
+   * consumer DO to reconcile on wake. Returns `undefined` for unknown servers.
+   */
+  getPersistedServerState(
+    serverId: string
+  ): MCPServerStateSnapshot | undefined {
+    const server = this.getServersFromStorage().find((s) => s.id === serverId);
+    if (!server) return undefined;
+    const row = this._getServerStateRow(serverId);
+    return {
+      error: row?.error ?? undefined,
+      serverId,
+      // Fall back to deriving the state when no snapshot row has been written
+      // yet — e.g. an agent upgraded with a pending OAuth `auth_url` (no row
+      // exists), or the post-restore window before the connection
+      // re-establishes. Mirrors the resolution the notify chokepoint persists,
+      // so a poll-on-wake reader sees `authenticating` instead of a misleading
+      // `null`.
+      state:
+        (row?.state as MCPConnectionState | null) ??
+        this._resolveServerState(server),
+      url: server.server_url,
+      version: row?.version ?? 0
+    };
+  }
+
+  /** Durable snapshots for every known server. */
+  listPersistedServerStates(): MCPServerStateSnapshot[] {
+    return this.getServersFromStorage().map((server) => {
+      const row = this._getServerStateRow(server.id);
+      return {
+        error: row?.error ?? undefined,
+        serverId: server.id,
+        state:
+          (row?.state as MCPConnectionState | null) ??
+          this._resolveServerState(server),
+        url: server.server_url,
+        version: row?.version ?? 0
+      };
+    });
   }
 
   // Storage operations
@@ -437,6 +809,47 @@ export class MCPClientManager {
       newId,
       oldId
     );
+    // Keep the durable state snapshot keyed to the new id. A prior tombstone
+    // may already exist under newId (the id was used and removed before): if we
+    // simply moved oldId's row over it we could move the monotonic `version`
+    // *backwards*, breaking a poll-on-wake consumer holding a higher cursor for
+    // newId. Carry forward max(oldVersion, existingNewVersion) + 1 so the cursor
+    // never regresses across a migrate-onto-recycled-id.
+    this._ensureServerStateTable();
+    const oldStateRow = this._getServerStateRow(oldId);
+    const newStateRow = this._getServerStateRow(newId);
+    if (oldStateRow) {
+      const mergedVersion =
+        Math.max(oldStateRow.version, newStateRow?.version ?? 0) + 1;
+      this.sql(
+        "DELETE FROM cf_agents_mcp_server_state WHERE server_id = ?",
+        oldId
+      );
+      this.sql(
+        `INSERT INTO cf_agents_mcp_server_state
+           (server_id, state, error, version, updated_at)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(server_id) DO UPDATE SET
+           state = excluded.state,
+           error = excluded.error,
+           version = excluded.version,
+           updated_at = excluded.updated_at`,
+        newId,
+        oldStateRow.state,
+        oldStateRow.error,
+        mergedVersion,
+        Date.now()
+      );
+    } else if (newStateRow) {
+      // No source row to migrate; bump the existing newId row so a consumer
+      // still observes the id taking on a (newly migrated) live identity.
+      this.sql(
+        "UPDATE cf_agents_mcp_server_state SET version = ?, updated_at = ? WHERE server_id = ?",
+        newStateRow.version + 1,
+        Date.now(),
+        newId
+      );
+    }
 
     // 2. OAuth-related storage keys. The DurableObjectOAuthClientProvider
     //    keys everything under `/{clientName}/{serverId}/...`. Other servers
@@ -469,7 +882,14 @@ export class MCPClientManager {
     // 3. In-memory connection + disposables + authProvider.
     this._renameInMemoryConnection(oldId, newId);
 
-    this._onServerStateChanged.fire();
+    // Let serverId-keyed subscribers (e.g. durable settlement watches) follow
+    // the rename *before* the state notification below — so the subsequent
+    // onServerStateChanged(newId) pass can settle any re-targeted intent whose
+    // server already sits in a target state. Synchronous (Emitter.fire), so
+    // re-targeting lands in this turn ahead of the notify.
+    this._onServerIdMigrated.fire({ newId, oldId });
+
+    this._notifyServerStateChanged(newId);
   }
 
   private _renameInMemoryConnection(oldId: string, newId: string): void {
@@ -602,7 +1022,7 @@ export class MCPClientManager {
       this.mcpConnections[serverId].connectionState = MCPConnectionState.FAILED;
       this.mcpConnections[serverId].connectionError = error;
     }
-    this._onServerStateChanged.fire();
+    this._notifyServerStateChanged(serverId);
     return { serverId, authSuccess: false, authError: error };
   }
 
@@ -754,6 +1174,10 @@ export class MCPClientManager {
       callback_url: "",
       server_options: JSON.stringify({ bindingName, props })
     });
+    // The RPC connect/discover path notifies *before* this row exists, so the
+    // snapshot was dropped. Notify now that the config row is saved, so
+    // getPersistedServerState() reflects the (already ready) connection.
+    this._notifyServerStateChanged(id);
   }
 
   /**
@@ -768,6 +1192,11 @@ export class MCPClientManager {
     if (this._isRestored) {
       return;
     }
+
+    // Reclaim orphan snapshot tombstones on wake (the table is core-owned, so
+    // this runs even for agents that don't use settlement watches). Guarded so
+    // it's a no-op for agents that never created the table.
+    this.pruneServerStateTombstones();
 
     const servers = this.getServersFromStorage();
 
@@ -850,8 +1279,23 @@ export class MCPClientManager {
       // If auth_url exists, OAuth flow is in progress - set state and wait for callback
       if (server.auth_url) {
         conn.connectionState = MCPConnectionState.AUTHENTICATING;
+        // Persist the transitional state synchronously, before any consumer can
+        // poll, so the durable snapshot is bumped off a stale pre-hibernation
+        // value (see below).
+        this._notifyServerStateChanged(server.id);
         continue;
       }
+
+      // Persist the transitional CONNECTING state synchronously, BEFORE kicking
+      // off the (non-awaited) background reconnect. Without this, the durable
+      // snapshot keeps serving the pre-hibernation state for the whole reconnect
+      // window — so a cross-DO consumer polling right after the owner wakes
+      // could read a stale `ready` even though the connection (and its auth) is
+      // being re-established and may no longer be valid. `_persistServerState`
+      // only bumps `version` when the state actually changes, so a still-ready
+      // connection that this downgrades to `connecting` and back does not churn
+      // beyond the real transitions the reconnect already emits.
+      this._notifyServerStateChanged(server.id);
 
       // Start connection in background (don't await) to avoid blocking the DO
       this._trackConnection(
@@ -1175,6 +1619,17 @@ export class MCPClientManager {
       }
     });
 
+    // A pending OAuth `authUrl` means the server is awaiting authorization, not
+    // connecting. Reflect that on the freshly-created connection (which defaults
+    // to CONNECTING) so the first state-change payload and durable snapshot
+    // report `authenticating` rather than `connecting` — mirrors the
+    // connectToServer() auth path. `_resolveServerState` keeps "live state wins",
+    // so this must be set on the connection, not inferred only from `auth_url`.
+    if (options.authUrl) {
+      this.mcpConnections[id].connectionState =
+        MCPConnectionState.AUTHENTICATING;
+    }
+
     // Save to storage (exclude authProvider since it's recreated during restore)
     const { authProvider: _, ...transportWithoutAuth } =
       options.transport ?? {};
@@ -1192,7 +1647,7 @@ export class MCPClientManager {
       })
     });
 
-    this._onServerStateChanged.fire();
+    this._notifyServerStateChanged(id);
 
     return id;
   }
@@ -1221,7 +1676,7 @@ export class MCPClientManager {
 
     const error = await conn.init();
     this.updateStoredSessionId(id, conn.sessionId);
-    this._onServerStateChanged.fire();
+    this._notifyServerStateChanged(id);
 
     switch (conn.connectionState) {
       case MCPConnectionState.FAILED:
@@ -1253,7 +1708,7 @@ export class MCPClientManager {
             client_id: clientId ?? null
           });
           // Broadcast again so clients receive the auth_url
-          this._onServerStateChanged.fire();
+          this._notifyServerStateChanged(id);
         }
 
         this._onObservabilityEvent.fire({
@@ -1464,7 +1919,7 @@ export class MCPClientManager {
       );
       this.updateStoredSessionId(serverId, conn.sessionId);
       const result = this.oauthCallbackSuccess(serverId, conn);
-      this._onServerStateChanged.fire();
+      this._notifyServerStateChanged(serverId);
 
       return result;
     } catch (err) {
@@ -1502,7 +1957,7 @@ export class MCPClientManager {
 
     // Delegate to connection's discover method which handles cancellation and timeout
     const result = await conn.discover(options);
-    this._onServerStateChanged.fire();
+    this._notifyServerStateChanged(serverId);
 
     return {
       ...result,
@@ -1561,7 +2016,7 @@ export class MCPClientManager {
       async () => this.connectToServer(serverId),
       { baseDelayMs, maxDelayMs }
     );
-    this._onServerStateChanged.fire();
+    this._notifyServerStateChanged(serverId);
 
     if (connectResult.state === MCPConnectionState.CONNECTED) {
       await this.discoverIfConnected(serverId);
@@ -1769,6 +2224,14 @@ export class MCPClientManager {
    * Remove an MCP server - closes connection if active and removes from storage.
    */
   async removeServer(serverId: string): Promise<void> {
+    // Capture the last-known URL *before* the storage row is deleted so it can
+    // ride in the removal signals — URL-targeted matchers (e.g. durable
+    // settlement watches) resolve against the captured url, not live storage,
+    // so the events can fire after deletion.
+    const removedUrl = this.getServersFromStorage().find(
+      (s) => s.id === serverId
+    )?.server_url;
+
     if (this.mcpConnections[serverId]) {
       try {
         await this.closeConnection(serverId);
@@ -1777,7 +2240,36 @@ export class MCPClientManager {
       }
     }
     this.removeServerFromStorage(serverId);
-    this._onServerStateChanged.fire();
+    // Tombstone (not delete) so `version` stays monotonic if this id is
+    // re-added later.
+    this._tombstoneServerState(serverId);
+    const version = this._getServerStateRow(serverId)?.version ?? 0;
+
+    // Signal removal *after* the storage row is gone, synchronously within this
+    // turn (no `await` between deletion and the fires), so any cancellation
+    // settle-write lands in this turn's output gate and a broadcast subscriber
+    // that re-reads storage observes the deletion rather than a stale list.
+    //
+    // We emit BOTH signals:
+    //  1. `onServerStateChanged` with the terminal `state: "removed"` sentinel,
+    //     so subscribers that only watch state changes (the pre-`onServerRemoved`
+    //     contract) still learn of the removal instead of silently keeping a
+    //     deleted server. The sentinel is event-payload-only — not an
+    //     `MCPConnectionState` — so the FSM, snapshot, and settlement targets
+    //     stay clean (see the RFC).
+    //  2. `onServerRemoved` (the canonical, structured removal event), fired
+    //     unconditionally so a serverId-targeted matcher is cancelled even when
+    //     the last-known url is unknown (double-remove, or a never-persisted
+    //     id). An empty url simply means URL-targeted matches can't resolve;
+    //     serverId-targeted matches still do.
+    const url = removedUrl ?? "";
+    this._onServerStateChanged.fire({
+      serverId,
+      state: "removed",
+      url,
+      version
+    });
+    this._onServerRemoved.fire({ serverId, url });
   }
 
   /**
@@ -1796,7 +2288,10 @@ export class MCPClientManager {
     } finally {
       // Dispose manager-level emitters
       this._onServerStateChanged.dispose();
+      this._onServerRemoved.dispose();
+      this._onServerIdMigrated.dispose();
       this._onObservabilityEvent.dispose();
+      this._postRestoreHooks.length = 0;
     }
   }
 

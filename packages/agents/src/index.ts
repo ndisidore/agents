@@ -835,6 +835,12 @@ function getNextCronTime(cron: string) {
 export type { TransportType } from "./mcp/types";
 export type { RetryOptions } from "./retries";
 export { normalizeServerId, MCP_SERVER_ID_MAX_LENGTH } from "./mcp/client";
+export type {
+  MCPServerStateChange,
+  MCPServerRemoval,
+  MCPServerIdMigration,
+  MCPServerStateSnapshot
+} from "./mcp/client";
 export {
   DurableObjectOAuthClientProvider,
   type AgentMcpOAuthProvider,
@@ -2057,9 +2063,17 @@ export class Agent<
         this.createMcpOAuthProvider(callbackUrl)
     });
 
-    // Broadcast server state whenever MCP state changes (register, connect, OAuth, remove, etc.)
+    // Broadcast server state whenever MCP state changes (register, connect, OAuth, etc.)
     this._disposables.add(
-      this.mcp.onServerStateChanged(async () => {
+      this.mcp.onServerStateChanged(() => {
+        this.broadcastMcpServers();
+      })
+    );
+    // Removal also fires a terminal `onServerStateChanged` (state: "removed"),
+    // so the broadcast above already covers it; subscribe to `onServerRemoved`
+    // too for robustness (a redundant broadcast is idempotent/harmless).
+    this._disposables.add(
+      this.mcp.onServerRemoved(() => {
         this.broadcastMcpServers();
       })
     );
@@ -2443,6 +2457,16 @@ export class Agent<
             await this.mcp.restoreConnectionsFromStorage(this.name);
             await this._restoreRpcMcpServers();
             this.broadcastMcpServers();
+
+            // Internal MCP-subsystem recovery (e.g. durable settlement
+            // watches) runs here — not in user onStart — so it can't be
+            // silently skipped by a subclass that forgets super.onStart().
+            // Invoked after both HTTP/OAuth (restoreConnectionsFromStorage)
+            // and RPC MCP restore so recovery observes fully-restored
+            // connection state, and awaited because recovery re-arms the
+            // durable deadline / at-least-once delivery drivers (not a
+            // fire-and-forget signal).
+            await this.mcp._runPostRestoreHooks();
 
             this._checkOrphanedWorkflows();
             await this._checkRunFibers();
@@ -9599,6 +9623,7 @@ export class Agent<
   /** @internal Drop every internal Agents SDK table during top-level destroy. */
   protected _dropInternalTablesForDestroy(): void {
     this.sql`DROP TABLE IF EXISTS cf_agents_mcp_servers`;
+    this.sql`DROP TABLE IF EXISTS cf_agents_mcp_server_state`;
     this.sql`DROP TABLE IF EXISTS cf_agents_state`;
     this.sql`DROP TABLE IF EXISTS cf_agents_schedules`;
     this.sql`DROP TABLE IF EXISTS cf_agents_queues`;

@@ -6,27 +6,28 @@ The core Agents SDK, published to npm as `agents`. This is the most complex pack
 
 Each export maps to a public entry point that users `import` from. These are the boundaries of the public API — changes here need a changeset.
 
-| Import path                  | Source file(s)               | Purpose                                                                      |
-| ---------------------------- | ---------------------------- | ---------------------------------------------------------------------------- |
-| `agents`                     | `src/index.ts`               | Agent base class, routing, connections, RPC, state, scheduling, SQL          |
-| `agents/client`              | `src/client.ts`              | Browser/Node WebSocket client (`AgentClient`) via partysocket                |
-| `agents/react`               | `src/react.tsx`              | `useAgent` React hook, state sync, RPC from components                       |
-| `agents/chat`                | `src/chat/index.ts`          | Shared chat primitives used by `@cloudflare/ai-chat` and `@cloudflare/think` |
-| `agents/mcp`                 | `src/mcp/index.ts`           | `McpAgent` base class for building MCP servers                               |
-| `agents/mcp/client`          | `src/mcp/client.ts`          | MCP client manager (connect to remote MCP servers from an Agent)             |
-| `agents/email`               | `src/email.ts`               | Email routing, resolvers, header signing                                     |
-| `agents/workflows`           | `src/workflows.ts`           | `AgentWorkflow` — Workflows integrated with Agents                           |
-| `agents/schedule`            | `src/schedule.ts`            | Scheduling types                                                             |
-| `agents/observability`       | `src/observability/index.ts` | Observability event types and emitters                                       |
-| `agents/ai-chat-agent`       | `src/ai-chat-agent.ts`       | Legacy AI chat agent (prefer `@cloudflare/ai-chat`)                          |
-| `agents/ai-react`            | `src/ai-react.tsx`           | Legacy AI React hooks (prefer `@cloudflare/ai-chat`)                         |
-| `agents/tsconfig`            | `agents.tsconfig.json`       | Shared TypeScript config for all projects in the repo                        |
-| `agents/vite`                | `src/vite.ts`                | Vite plugin — decorator transforms and the `agents:skills` import transform  |
-| `agents/skills`              | `src/skills/index.ts`        | Framework-agnostic Agent Skills engine — sources, `SkillRegistry`, runner    |
-| `agents/experimental/webmcp` | `src/experimental/webmcp.ts` | WebMCP adapter — bridges MCP tools to Chrome's `navigator.modelContext`      |
-| `agents/browser`             | `src/browser/index.ts`       | Browser Run helpers — CDP sessions, connector, Quick Action primitives       |
-| `agents/browser/ai`          | `src/browser/ai.ts`          | AI SDK browser tools — `createBrowserTools` (CDP) + `createQuickActionTools` |
-| `agents/browser/tanstack-ai` | `src/browser/tanstack-ai.ts` | TanStack AI browser tool (`browser_execute`)                                 |
+| Import path                          | Source file(s)                     | Purpose                                                                                                        |
+| ------------------------------------ | ---------------------------------- | -------------------------------------------------------------------------------------------------------------- |
+| `agents`                             | `src/index.ts`                     | Agent base class, routing, connections, RPC, state, scheduling, SQL                                            |
+| `agents/client`                      | `src/client.ts`                    | Browser/Node WebSocket client (`AgentClient`) via partysocket                                                  |
+| `agents/react`                       | `src/react.tsx`                    | `useAgent` React hook, state sync, RPC from components                                                         |
+| `agents/chat`                        | `src/chat/index.ts`                | Shared chat primitives used by `@cloudflare/ai-chat` and `@cloudflare/think`                                   |
+| `agents/mcp`                         | `src/mcp/index.ts`                 | `McpAgent` base class for building MCP servers                                                                 |
+| `agents/mcp/client`                  | `src/mcp/client.ts`                | MCP client manager (connect to remote MCP servers from an Agent)                                               |
+| `agents/email`                       | `src/email.ts`                     | Email routing, resolvers, header signing                                                                       |
+| `agents/workflows`                   | `src/workflows.ts`                 | `AgentWorkflow` — Workflows integrated with Agents                                                             |
+| `agents/schedule`                    | `src/schedule.ts`                  | Scheduling types                                                                                               |
+| `agents/observability`               | `src/observability/index.ts`       | Observability event types and emitters                                                                         |
+| `agents/ai-chat-agent`               | `src/ai-chat-agent.ts`             | Legacy AI chat agent (prefer `@cloudflare/ai-chat`)                                                            |
+| `agents/ai-react`                    | `src/ai-react.tsx`                 | Legacy AI React hooks (prefer `@cloudflare/ai-chat`)                                                           |
+| `agents/tsconfig`                    | `agents.tsconfig.json`             | Shared TypeScript config for all projects in the repo                                                          |
+| `agents/vite`                        | `src/vite.ts`                      | Vite plugin — decorator transforms and the `agents:skills` import transform                                    |
+| `agents/skills`                      | `src/skills/index.ts`              | Framework-agnostic Agent Skills engine — sources, `SkillRegistry`, runner                                      |
+| `agents/experimental/webmcp`         | `src/experimental/webmcp.ts`       | WebMCP adapter — bridges MCP tools to Chrome's `navigator.modelContext`                                        |
+| `agents/experimental/mcp-settlement` | `src/experimental/mcp-settlement/` | `withMcpSettlement(Agent)` mixin — durable, hibernation-safe per-server MCP readiness/timeout/cancel callbacks |
+| `agents/browser`                     | `src/browser/index.ts`             | Browser Run helpers — CDP sessions, connector, Quick Action primitives                                         |
+| `agents/browser/ai`                  | `src/browser/ai.ts`                | AI SDK browser tools — `createBrowserTools` (CDP) + `createQuickActionTools`                                   |
+| `agents/browser/tanstack-ai`         | `src/browser/tanstack-ai.ts`       | TanStack AI browser tool (`browser_execute`)                                                                   |
 
 The `agents:skills` virtual-module types ship from `skills-module.d.ts` (referenced from the built `dist/index.d.ts`); `@cloudflare/think` consumes `agents/skills` and `@cloudflare/ai-chat` can too.
 
@@ -94,6 +95,7 @@ src/
 
   experimental/         # Experimental features (published but unstable)
     webmcp.ts           # WebMCP adapter (browser-side, uses MCP SDK client)
+    mcp-settlement/     # withMcpSettlement mixin + McpSettlementStore (durable MCP readiness watches)
 
   browser/              # Browser Run integration (experimental)
     index.ts            # Barrel for agents/browser

@@ -1,0 +1,21 @@
+{
+  "name": "@cloudflare/agents-mcp-settlement-example",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "types": "wrangler types env.d.ts --include-runtime false"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.29.0",
+    "agents": "*",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20260612.1",
+    "@types/node": "^25.9.3",
+    "typescript": "^6.0.3",
+    "wrangler": "^4.100.0"
+  }
+}

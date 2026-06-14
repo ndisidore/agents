@@ -22,7 +22,8 @@ const entries = [
   "src/browser/index.ts",
   "src/browser/ai.ts",
   "src/browser/tanstack-ai.ts",
-  "src/experimental/webmcp.ts"
+  "src/experimental/webmcp.ts",
+  "src/experimental/mcp-settlement/index.ts"
 ];
 
 for (const entry of entries) {

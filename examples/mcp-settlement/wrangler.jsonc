@@ -1,0 +1,20 @@
+{
+  "$schema": "../../node_modules/wrangler/config-schema.json",
+  "name": "mcp-settlement-example",
+  "compatibility_date": "2026-01-28",
+  "compatibility_flags": ["nodejs_compat"],
+  "main": "src/index.ts",
+  "durable_objects": {
+    "bindings": [
+      { "class_name": "DemoMcpServer", "name": "DemoMcpServer" },
+      { "class_name": "IdentityDO", "name": "IdentityDO" },
+      { "class_name": "WorkspaceDO", "name": "WorkspaceDO" }
+    ]
+  },
+  "migrations": [
+    {
+      "new_sqlite_classes": ["DemoMcpServer", "IdentityDO", "WorkspaceDO"],
+      "tag": "v1"
+    }
+  ]
+}
