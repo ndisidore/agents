@@ -110,6 +110,58 @@ describe("durable MCP settlement watches", () => {
     expect(results[0].type).toBe("settled");
   });
 
+  it("schedules the delivery before cancelling the deadline, delivering once across a restart", async () => {
+    // Guards the awake-settle ordering: the callback schedule must be inserted
+    // (and recorded) BEFORE the deadline alarm is cancelled, so an eviction at
+    // an await boundary can never leave the intent terminal-but-undelivered
+    // with no alarm to wake recovery. After the settle there is exactly one
+    // schedule — the delivery, not the deadline — and a cold restore delivers
+    // exactly once (no orphaned row, no double).
+    const stub = await settlementAgent("deliver-before-cancel");
+
+    await stub.seedMcpServer(
+      "dbc-server",
+      "https://mcp.example.com/dbc",
+      MCPConnectionState.CONNECTED
+    );
+    const watch = await stub.createSettlementWatchByServerId("dbc-server", {
+      deadlineMs: 60_000
+    });
+    expect(
+      (await stub.getSettlementIntentRows())[0].deadline_schedule_id
+    ).toBeTruthy();
+
+    // Awake path settles via a ready transition.
+    await stub.makeServerReadyThroughDiscovery("dbc-server");
+    const settledRow = await waitForSettlementSchedule(stub, watch.intentId);
+
+    // Delivery recorded BEFORE the deadline was cancelled: the durable
+    // `delivery_schedule_id` is set (so an eviction here would replay it, never
+    // orphan it) and the deadline is cleared.
+    expect(settledRow.status).toBe("settled");
+    expect(settledRow.delivery_schedule_id).toBeTruthy();
+    expect(settledRow.deadline_schedule_id).toBeNull();
+
+    // No deadline alarm remains armed (it was cancelled after the delivery
+    // schedule landed).
+    const schedules = await stub.getSettlementScheduleRows();
+    expect(
+      schedules.some(
+        (schedule) =>
+          schedule.callback === "_cf_checkMcpSettlementIntentDeadline"
+      )
+    ).toBe(false);
+
+    // Deliver, then cold-restore (re-running recovery): still exactly once.
+    await runDurableObjectAlarm(stub);
+    await stub.recoverSettlementIntentsForTest();
+    await runDurableObjectAlarm(stub);
+
+    const results = await stub.getSettlementResults();
+    expect(results).toHaveLength(1);
+    expect(results[0].type).toBe("settled");
+  });
+
   it("fires timeout through the guarded deadline callback", async () => {
     const stub = await settlementAgent("timeout");
 
@@ -214,6 +266,53 @@ describe("durable MCP settlement watches", () => {
     ).toBeTruthy();
   });
 
+  it("isolates a corrupt server on restore: recovery runs and the stale snapshot is downgraded", async () => {
+    // A corrupt row (unparseable `server_options`) must be isolated per-server
+    // inside restore so it neither (a) skips the post-restore recovery hook —
+    // the durable backstop for settlement watches — nor (b) leaves its own stale
+    // `ready` snapshot readable by cross-DO consumers after a wake where no
+    // connection was restored.
+    const stub = await settlementAgent("recover-despite-restore-throw");
+
+    // A healthy READY server with a live watch that recovery should settle...
+    await stub.seedMcpServer(
+      "rdr-ready",
+      "https://mcp.example.com/rdr",
+      MCPConnectionState.READY
+    );
+    await stub.insertLiveSettlementIntentForTest("rdr-live", "rdr-ready");
+
+    // ...alongside a corrupt config row that was `ready` before hibernation.
+    await stub.seedCorruptServerOptionsForTest(
+      "rdr-corrupt",
+      "https://mcp.example.com/rdr-corrupt"
+    );
+    await stub.seedReadySnapshotRowForTest("rdr-corrupt");
+    expect(
+      (await stub.getPersistedServerStateForTest("rdr-corrupt"))?.state
+    ).toBe(MCPConnectionState.READY);
+
+    // Wake with restore actually re-running (so it hits the corrupt row).
+    await stub.recoverWithRestoreRerunForTest();
+
+    // (a) Recovery still settled the healthy server's live watch.
+    await waitForSettlementSchedule(stub, "rdr-live");
+    await runDurableObjectAlarm(stub);
+    const results = await stub.getSettlementResults();
+    expect(results).toHaveLength(1);
+    expect(results[0].type).toBe("settled");
+    expect(
+      (await stub.getSettlementIntentRows()).find((r) => r.id === "rdr-live")
+        ?.status
+    ).toBe("settled");
+
+    // (b) The corrupt server's stale `ready` snapshot was downgraded — a
+    // cross-DO consumer no longer reads a connection that was never restored.
+    expect(
+      (await stub.getPersistedServerStateForTest("rdr-corrupt"))?.state
+    ).not.toBe(MCPConnectionState.READY);
+  });
+
   it("re-arms a deadline that fires early with a fresh future-dated schedule", async () => {
     const stub = await settlementAgent("deadline-early");
 
@@ -310,7 +409,7 @@ describe("durable MCP settlement watches", () => {
     expect(results[0].type).toBe("cancelled");
   });
 
-  it("persists per-server state with a monotonic version (poll-on-wake enabler)", async () => {
+  it("persists per-server state (level-triggered poll-on-wake enabler)", async () => {
     const stub = await settlementAgent("persisted-state");
 
     await stub.seedMcpServer(
@@ -319,55 +418,30 @@ describe("durable MCP settlement watches", () => {
       MCPConnectionState.CONNECTED
     );
 
-    // registerServer drove one transition → version >= 1.
+    // registerServer drove one transition → a snapshot row exists.
     const afterRegister =
       await stub.getPersistedServerStateForTest("ps-server");
     expect(afterRegister).not.toBeNull();
-    const v1 = afterRegister!.version;
-    expect(v1).toBeGreaterThanOrEqual(1);
+    expect(afterRegister!.state).toBeTruthy();
 
     await stub.makeServerReadyThroughDiscovery("ps-server");
     const afterReady = await stub.getPersistedServerStateForTest("ps-server");
     expect(afterReady!.state).toBe(MCPConnectionState.READY);
-    expect(afterReady!.version).toBeGreaterThan(v1);
 
-    // The live state-change payload shares the same version cursor.
+    // The live state-change payload reports the same latest state.
     const change = await stub.getServerStateChangeForTest("ps-server");
-    expect(change!.version).toBe(afterReady!.version);
+    expect(change!.state).toBe(MCPConnectionState.READY);
 
-    // No-op re-notify (same ready state) must NOT bump the version.
+    // No-op re-notify (same ready state) must not churn the snapshot row.
+    const rowsBefore = await stub.getServerStateRowsForTest();
     await stub.makeServerReadyThroughDiscovery("ps-server");
     const afterNoop = await stub.getPersistedServerStateForTest("ps-server");
-    expect(afterNoop!.version).toBe(afterReady!.version);
+    expect(afterNoop!.state).toBe(MCPConnectionState.READY);
+    expect(await stub.getServerStateRowsForTest()).toEqual(rowsBefore);
 
-    // Removal clears the durable snapshot.
+    // Removal deletes the durable snapshot row.
     await stub.removeMcpServerForSettlementTest("ps-server");
     expect(await stub.getPersistedServerStateForTest("ps-server")).toBeNull();
-  });
-
-  it("keeps version monotonic across remove + re-add of a stable id", async () => {
-    const stub = await settlementAgent("version-readd");
-
-    await stub.seedMcpServer(
-      "stable-id",
-      "https://mcp.example.com/stable",
-      MCPConnectionState.CONNECTED
-    );
-    await stub.makeServerReadyThroughDiscovery("stable-id");
-    const before = await stub.getPersistedServerStateForTest("stable-id");
-    const versionBeforeRemove = before!.version;
-
-    await stub.removeMcpServerForSettlementTest("stable-id");
-
-    // Re-add under the SAME stable id — version must continue, not reset to 1,
-    // so a `version > lastSeen` consumer cursor doesn't go backwards and stall.
-    await stub.seedMcpServer(
-      "stable-id",
-      "https://mcp.example.com/stable",
-      MCPConnectionState.CONNECTED
-    );
-    const after = await stub.getPersistedServerStateForTest("stable-id");
-    expect(after!.version).toBeGreaterThan(versionBeforeRemove);
   });
 
   it("resolves AUTHENTICATING from auth_url when no live connection exists", async () => {
@@ -568,8 +642,7 @@ describe("durable MCP settlement watches", () => {
   // The durable cross-DO snapshot must not serve a stale `ready` after the
   // owner wakes: a server that was `ready` before hibernation is being
   // re-established on wake (its auth may no longer be valid), so the snapshot is
-  // downgraded to the transitional state synchronously during restore — with an
-  // advanced version so a version-deduping consumer actually observes it.
+  // downgraded to the transitional state synchronously during restore.
   it("does not serve a stale ready snapshot after wake while reconnecting", async () => {
     const stub = await settlementAgent("stale-ready");
 
@@ -582,7 +655,6 @@ describe("durable MCP settlement watches", () => {
 
     const ready = await stub.getPersistedServerStateForTest("stale-server");
     expect(ready!.state).toBe(MCPConnectionState.READY);
-    const readyVersion = ready!.version;
 
     // Fresh post-hibernation instance: connections gone, restore re-runs. The
     // returned snapshot is captured synchronously right after restore, so it
@@ -591,15 +663,14 @@ describe("durable MCP settlement watches", () => {
     const afterWake = await stub.simulateColdRestoreForTest("stale-server");
     expect(afterWake.state).not.toBe(MCPConnectionState.READY);
     expect(afterWake.state).toBe(MCPConnectionState.CONNECTING);
-    expect(afterWake.version).toBeGreaterThan(readyVersion);
   });
 
-  // Migrating onto a previously-used (tombstoned) id must not move the version
-  // cursor backwards.
-  it("keeps version monotonic when migrating onto a recycled id", async () => {
-    const stub = await settlementAgent("migrate-monotonic");
+  // Migrating onto a previously-used id: the snapshot is level-triggered, so the
+  // new id's snapshot reflects current live state and the old id's row is gone.
+  it("reflects current state on the new id after migrating onto a recycled id", async () => {
+    const stub = await settlementAgent("migrate-recycled");
 
-    // Drive "new-id" to a high version, then remove it (tombstone bumps again).
+    // Drive "new-id" to ready, then remove it (snapshot row deleted).
     await stub.seedMcpServer(
       "new-id",
       "https://mcp.example.com/new",
@@ -607,23 +678,22 @@ describe("durable MCP settlement watches", () => {
     );
     await stub.makeServerReadyThroughDiscovery("new-id");
     await stub.removeMcpServerForSettlementTest("new-id");
+    expect(await stub.getPersistedServerStateForTest("new-id")).toBeNull();
 
-    // A fresh "old-id" starts at a low version.
+    // A fresh "old-id" connects.
     await stub.seedMcpServer(
       "old-id",
       "https://mcp.example.com/old",
       MCPConnectionState.CONNECTED
     );
 
-    // Migrate old-id → new-id. The merged version must exceed the tombstone's,
-    // so a consumer holding new-id's higher cursor still observes the re-add.
+    // Migrate old-id → new-id. The new id's snapshot reflects old-id's live
+    // state; the old id's row is gone.
     await stub.migrateServerIdForTest("old-id", "new-id");
 
     const after = await stub.getPersistedServerStateForTest("new-id");
     expect(after).not.toBeNull();
-    // The tombstone reached version 3 (register=1, ready=2, remove=3); the
-    // migrated row must land strictly above it.
-    expect(after!.version).toBeGreaterThan(3);
+    expect(after!.state).toBe(MCPConnectionState.CONNECTED);
     expect(await stub.getPersistedServerStateForTest("old-id")).toBeNull();
   });
 
@@ -690,6 +760,45 @@ describe("durable MCP settlement watches", () => {
 
     // Expire + fire it: the timeout fires with no watcher present.
     await stub.expireSettlementDeadline("crash-intent");
+    await stub.backdateSchedule(deadlineScheduleId!, 1);
+    await runDurableObjectAlarm(stub);
+    await runDurableObjectAlarm(stub);
+
+    const results = await stub.getSettlementResults();
+    expect(results).toHaveLength(1);
+    expect(results[0].type).toBe("timeout");
+  });
+
+  // Defence-in-depth for the crash window: a same-key retry must repair an
+  // unarmed deadline in-session, not rely solely on the next wake — load-bearing
+  // for abandoned-OAuth, where the deadline alarm is the only wake source.
+  it("re-arms an unarmed deadline on a same-key retry without waiting for a wake", async () => {
+    const stub = await settlementAgent("retry-rearm");
+
+    // Crash window: a live keyed intent with a deadline but no armed schedule.
+    await stub.insertKeyedUnarmedDeadlineIntentForTest(
+      "retry-intent",
+      "https://mcp.example.com/retry",
+      60_000,
+      "retry-key"
+    );
+    let rows = await stub.getSettlementIntentRows();
+    expect(rows[0].deadline_schedule_id).toBeNull();
+
+    // Retry with the SAME idempotencyKey (created: false) must arm the deadline.
+    const result = await stub.createSettlementWatchByUrl(
+      "https://mcp.example.com/retry",
+      { deadlineMs: 60_000, idempotencyKey: "retry-key" }
+    );
+    expect(result.created).toBe(false);
+    expect(result.intentId).toBe("retry-intent");
+
+    rows = await stub.getSettlementIntentRows();
+    const deadlineScheduleId = rows[0].deadline_schedule_id;
+    expect(deadlineScheduleId).toBeTruthy();
+
+    // The repaired deadline fires a timeout with no watcher and no prior wake.
+    await stub.expireSettlementDeadline("retry-intent");
     await stub.backdateSchedule(deadlineScheduleId!, 1);
     await runDurableObjectAlarm(stub);
     await runDurableObjectAlarm(stub);
@@ -816,8 +925,6 @@ describe("durable MCP settlement watches", () => {
     // snap-b's persisted snapshot reflects the register-time transition until a
     // notified change advances it.
     expect(byId["snap-b"].state).toBeTruthy();
-    expect(byId["snap-a"].version).toBeGreaterThanOrEqual(1);
-    expect(byId["snap-b"].version).toBeGreaterThanOrEqual(1);
   });
 
   // Removal re-emits a terminal `onServerStateChanged` (state: "removed") so a
@@ -830,7 +937,7 @@ describe("durable MCP settlement watches", () => {
       "https://mcp.example.com/gone",
       MCPConnectionState.READY
     );
-    const before = await stub.getPersistedServerStateForTest("gone");
+    expect(await stub.getPersistedServerStateForTest("gone")).not.toBeNull();
     await stub.clearRecordedStateChanges();
 
     await stub.removeMcpServerForSettlementTest("gone");
@@ -841,8 +948,13 @@ describe("durable MCP settlement watches", () => {
     expect(removed).toHaveLength(1);
     expect(removed[0].serverId).toBe("gone");
     expect(removed[0].url).toBe("https://mcp.example.com/gone");
-    // Tombstone bump keeps `version` strictly monotonic past the last snapshot.
-    expect(removed[0].version).toBeGreaterThan(before!.version);
+    // Removal deletes the snapshot row outright (no tombstone).
+    expect(await stub.getPersistedServerStateForTest("gone")).toBeNull();
+    expect(
+      (await stub.getServerStateRowsForTest()).find(
+        (r) => r.server_id === "gone"
+      )
+    ).toBeUndefined();
   });
 
   // The terminal "removed" state-change must not produce a second settlement on
@@ -879,9 +991,14 @@ describe("durable MCP settlement watches", () => {
 
     const snapshot = await stub.getPersistedServerStateForTest("upgraded");
     expect(snapshot).not.toBeNull();
+    // No snapshot row was ever written — the state is derived from the pending
+    // OAuth auth_url, not read from a row.
     expect(snapshot!.state).toBe(MCPConnectionState.AUTHENTICATING);
-    // No row was ever written, so the version cursor starts at 0.
-    expect(snapshot!.version).toBe(0);
+    expect(
+      (await stub.getServerStateRowsForTest()).find(
+        (r) => r.server_id === "upgraded"
+      )
+    ).toBeUndefined();
 
     const entry = (await stub.listPersistedServerStatesForTest()).find(
       (s) => s.serverId === "upgraded"
@@ -904,43 +1021,5 @@ describe("durable MCP settlement watches", () => {
     expect(rows.find((r) => r.id === "orphan-intent")?.status).toBe(
       "cancelled"
     );
-  });
-
-  // Orphan tombstones (removed-and-not-re-added) are reclaimed once aged past
-  // the retention window; live rows and recent tombstones are preserved.
-  it("prunes aged orphan server-state tombstones but keeps live and recent rows", async () => {
-    const stub = await settlementAgent("prune-tombstones");
-
-    await stub.seedMcpServer(
-      "old-orphan",
-      "https://mcp.example.com/old-orphan",
-      MCPConnectionState.READY
-    );
-    await stub.removeMcpServerForSettlementTest("old-orphan");
-
-    await stub.seedMcpServer(
-      "recent-orphan",
-      "https://mcp.example.com/recent-orphan",
-      MCPConnectionState.READY
-    );
-    await stub.removeMcpServerForSettlementTest("recent-orphan");
-
-    await stub.seedMcpServer(
-      "live-server",
-      "https://mcp.example.com/live",
-      MCPConnectionState.READY
-    );
-
-    // Age the first tombstone beyond the 24h retention window.
-    await stub.backdateServerStateRow("old-orphan", 25 * 60 * 60 * 1000);
-
-    await stub.pruneServerStateTombstonesForTest();
-
-    const ids = (await stub.getServerStateRowsForTest()).map(
-      (r) => r.server_id
-    );
-    expect(ids).not.toContain("old-orphan");
-    expect(ids).toContain("recent-orphan");
-    expect(ids).toContain("live-server");
   });
 });

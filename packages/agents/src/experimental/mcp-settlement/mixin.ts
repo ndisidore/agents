@@ -191,13 +191,31 @@ export function withMcpSettlement<TBase extends AgentConstructor>(
 
       if (
         opts.deadlineMs !== undefined &&
-        registration.created &&
         registration.deliveries.length === 0
       ) {
-        await this._scheduleMcpSettlementDeadline({
-          deadlineAt: Date.now() + opts.deadlineMs,
-          intentId: registration.intentId
-        });
+        if (registration.created) {
+          await this._scheduleMcpSettlementDeadline({
+            deadlineAt: Date.now() + opts.deadlineMs,
+            intentId: registration.intentId
+          });
+        } else {
+          // Retry onto an existing live intent (same idempotencyKey). Repair a
+          // crash-window deadline that was never armed (intent persisted but the
+          // registration crashed before recording `deadline_schedule_id`) so we
+          // don't rely solely on the next wake — load-bearing for the
+          // abandoned-OAuth case, where the deadline alarm is the ONLY wake
+          // source. Re-arm from the intent's ORIGINAL `deadline_at` (not a fresh
+          // `now + deadlineMs`, which would extend it); the schedule is
+          // idempotent, so an already-armed deadline dedupes (no change), and an
+          // already-elapsed one is armed for the floor (~1s) and settles a
+          // timeout on the next alarm via the guarded handler.
+          const pending = this._settlement.getPendingDeadline(
+            registration.intentId
+          );
+          if (pending) {
+            await this._scheduleMcpSettlementDeadline(pending);
+          }
+        }
       }
 
       return {
@@ -218,25 +236,35 @@ export function withMcpSettlement<TBase extends AgentConstructor>(
       return true;
     }
 
-    /** @internal Fire-and-forget schedule from a synchronous event handler. */
+    /**
+     * @internal Schedule from a synchronous event handler. The schedule is
+     * deferred (not awaited inline in the firing turn), but anchored with
+     * `ctx.waitUntil` so the runtime keeps the DO alive until it lands —
+     * otherwise an eviction at an await boundary could drop the delivery, and
+     * the awake path would rely on an unrelated future activation to replay it.
+     */
     private _deliverMcpSettlement(delivery: MCPSettlementDelivery): void {
-      void this._scheduleMcpSettlementDelivery(delivery).catch((error) => {
-        console.error(
-          `[mcp-settlement] Failed to schedule callback "${delivery.callback}" for intent "${delivery.intentId}":`,
-          error
-        );
-      });
+      this.ctx.waitUntil(
+        this._scheduleMcpSettlementDelivery(delivery).catch((error) => {
+          console.error(
+            `[mcp-settlement] Failed to schedule callback "${delivery.callback}" for intent "${delivery.intentId}":`,
+            error
+          );
+        })
+      );
     }
 
     /** @internal Durably schedule a settlement callback (at-least-once). */
     private async _scheduleMcpSettlementDelivery(
       delivery: MCPSettlementDelivery
     ): Promise<void> {
-      if (delivery.deadlineScheduleId) {
-        await this.cancelSchedule(delivery.deadlineScheduleId);
-        this._settlement.clearSettlementDeadlineSchedule(delivery.intentId);
-      }
-
+      // Insert the callback schedule BEFORE cancelling the deadline alarm, so
+      // there is always at least one alarm armed across every `await` boundary.
+      // If we cancelled first, an eviction in the gap before the callback
+      // schedule landed would leave the intent terminal-but-undelivered with no
+      // alarm to wake recovery — lost until the next unrelated activation. A
+      // deadline alarm that survives this ordering simply no-ops (the intent is
+      // already terminal, so the guarded handler finds no pending deadline).
       const callback = delivery.callback as keyof this;
       const schedule = await this.schedule<MCPServerSettledResult>(
         0,
@@ -248,6 +276,11 @@ export function withMcpSettlement<TBase extends AgentConstructor>(
         delivery.intentId,
         schedule.id
       );
+
+      if (delivery.deadlineScheduleId) {
+        await this.cancelSchedule(delivery.deadlineScheduleId);
+        this._settlement.clearSettlementDeadlineSchedule(delivery.intentId);
+      }
     }
 
     /**

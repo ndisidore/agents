@@ -21,7 +21,7 @@ The shape this is built for: **one DO owns an MCP connection; one or more other 
                     │ IdentityDO (owns this.mcp)   │
    OAuth completes  │  withMcpSettlement(Agent)    │
    ───────────────▶ │  • durable watch → onSettled │
-                    │  • persists {state, version} │
+                    │  • persists {state}          │
                     └──────────────┬──────────────┘
                        live event  │  durable snapshot
               (awake consumers)    │  (poll on wake)
@@ -43,7 +43,7 @@ Use the watch directly (no consumers) whenever you just need to **gate** owner-D
 
 - Durably records the watch and fires your callback through `this.schedule()` — survives hibernation, at-least-once.
 - Re-derives outstanding watches and re-arms deadlines on wake; settles `ready`/`failed`/custom states, `timeout`, and `cancelled`.
-- Persists each server's last-known `{ state, version }` for reading without a live probe, and emits a live `onServerStateChanged` payload.
+- Persists each server's last-known `{ state }` for reading without a live probe, and emits a live `onServerStateChanged` payload.
 
 **What's yours:**
 
@@ -104,7 +104,7 @@ Registers a durable, **one-shot** watch. Returns `{ intentId, created }` (`creat
 - `opts.deadlineMs` — optional; fires a `timeout` result if no state matches in time. **Deadlines are approximate**: the alarm scheduler floors fire times to whole seconds and the watch adds ~1s of slack so a timeout is never lost to flooring, so a `timeout` may fire up to ~1s after `deadlineMs`. Don't use it where sub-second precision matters.
 - `opts.idempotencyKey` — optional; dedupes concurrent registrations.
 
-It fires **once** — it's a durable latch/gate, not an ongoing subscription. To track a server's state **over time** (e.g. a banner: ready → needs-reauth → ready), don't re-arm watches in a loop (you'd miss transitions in the gap between firing and re-arming); read the durable versioned snapshot instead — see [Cross-DO fan-out](#cross-do-fan-out-app-level).
+It fires **once** — it's a durable latch/gate, not an ongoing subscription. To track a server's state **over time** (e.g. a banner: ready → needs-reauth → ready), don't re-arm watches in a loop (you'd miss transitions in the gap between firing and re-arming); read the durable snapshot instead — see [Cross-DO fan-out](#cross-do-fan-out-app-level).
 
 ### `cancelMcpSettlementWatch(intentId)`
 
@@ -133,37 +133,34 @@ How the guarantee is actually built — the layering matters:
 
 The owner DO's callback is the durable trigger; routing to consumer DOs is yours. The SDK provides two building blocks so you don't have to poll:
 
-1. **Awake consumers** subscribe to the live signal. `this.mcp.onServerStateChanged` now carries `{ serverId, url, state, error?, version }`; wire it to your consumers however you like (WebSocket, RPC).
-2. **Hibernating consumers reconcile on their own wake** by reading the owner's durable, versioned snapshot — no live transport probe required:
+1. **Awake consumers** subscribe to the live signal. `this.mcp.onServerStateChanged` carries `{ serverId, url, state, error? }`; wire it to your consumers however you like (WebSocket, RPC).
+2. **Hibernating consumers reconcile on their own wake** by reading the owner's durable snapshot — no live transport probe required:
 
 ```typescript
 // On the connection-owning (owner) DO — expose the durable snapshot:
 class OwnerAgent extends withMcpSettlement(Agent<Env>) {
   @callable()
   getServerState(serverId: string) {
-    return this.mcp.getPersistedServerState(serverId); // { state, version, ... }
+    return this.mcp.getPersistedServerState(serverId); // { state, ... }
   }
 }
 
 // On a consumer DO — reconcile what you missed while hibernating, then subscribe:
 class ConsumerAgent extends Agent<Env> {
   async onStart() {
-    // Poll-on-wake, then keep applying live updates — both keyed on `version`.
-    await this.applyIfNewer(await getOwner(this).getServerState(MY_SERVER_ID));
+    // Poll-on-wake, then keep applying live updates — both level-triggered.
+    this.apply(await getOwner(this).getServerState(MY_SERVER_ID));
     // Live updates while awake (app wiring — e.g. the owner relays its event):
-    onAuthUpdate((snap) => this.applyIfNewer(snap));
+    onAuthUpdate((snap) => this.apply(snap));
   }
 
-  private async applyIfNewer(snap?: { state: string | null; version: number }) {
-    const lastSeen = (await this.ctx.storage.get<number>("authVersion")) ?? -1;
-    // Dedupe by version on BOTH paths — the live event may repeat a version on
-    // a no-op notification, and poll + push can overlap.
-    if (snap && snap.version > lastSeen) {
-      this.applyAuthState(snap); // update banner (handles "authenticating" too)
-      await this.ctx.storage.put("authVersion", snap.version);
-    }
+  private apply(snap?: { state: string | null }) {
+    // Level-triggered: apply the latest state, idempotently. Re-applying the
+    // same state is a no-op, so neither path needs an ordering cursor — a late
+    // older push is self-correcting on the next push/poll.
+    if (snap) this.applyAuthState(snap); // update banner (handles "authenticating" too)
   }
 }
 ```
 
-`version` is monotonic per server (it survives remove + re-add of a stable id) and is shared by the live event and the snapshot, so awake-push and poll-on-wake use one cursor — dedupe by it on both. `state` includes `"authenticating"` (derived from a pending OAuth `auth_url`), so the banner's re-auth signal is pollable. The SDK never pushes to consumers or tracks a subscriber registry — multi-DO routing stays your code.
+The snapshot is **level-triggered**: the live event and the durable snapshot both describe the latest `{ state }`, applied idempotently — there is no ordering cursor to track, and a late-arriving older push is self-correcting on the next push/poll. `state` includes `"authenticating"` (derived from a pending OAuth `auth_url`), so the banner's re-auth signal is pollable. The SDK never pushes to consumers or tracks a subscriber registry — multi-DO routing stays your code.

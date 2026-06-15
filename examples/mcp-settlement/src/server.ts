@@ -12,7 +12,7 @@
  *   2. Awake fast-path       — the owner relays `onServerStateChanged` (an
  *      in-memory event, immediate) to subscribed, awake consumers.
  *   3. Poll-on-wake          — a hibernating consumer reconciles on ITS OWN
- *      wake by reading the owner's durable `{ state, version }` snapshot.
+ *      wake by reading the owner's durable `{ state }` snapshot.
  *
  * The SDK never pushes to or tracks consumers — the subscriber registry and the
  * relay below are ordinary app code.
@@ -28,6 +28,7 @@ import {
 import { McpAgent } from "agents/mcp";
 import { withMcpSettlement } from "agents/experimental/mcp-settlement";
 import type { MCPServerSettledResult } from "agents/experimental/mcp-settlement";
+import type { MCPServerStateSnapshot } from "agents/mcp/client";
 import { z } from "zod";
 
 /** A trivial bundled MCP server so the example is fully self-contained. */
@@ -51,7 +52,8 @@ export class DemoMcpServer extends McpAgent<Env, { calls: number }, {}> {
 type Banner = {
   serverId: string;
   state: string | null;
-  version: number;
+  /** Last-known connection error, if any (carried on the shared snapshot). */
+  error?: string;
   /** Where the consumer last learned this from. */
   via: "poll-on-wake" | "live-push" | "none";
   /**
@@ -76,7 +78,7 @@ export class IdentityDO extends withMcpSettlement(Agent<Env>) {
   // hibernates, so the live-push fast-path (`fanout`) silently reaches no one
   // after a sleep — by design. Durability lives entirely in the snapshot +
   // poll-on-wake path (`WorkspaceDO.onStart` re-`subscribe`s and re-reads the
-  // owner's `{ state, version }`). A production app that needs the push path to
+  // owner's `{ state }`). A production app that needs the push path to
   // survive the owner's hibernation would persist this registry (e.g. in
   // `ctx.storage`) and rehydrate it in `onStart`.
   private subscribers = new Set<string>();
@@ -88,7 +90,9 @@ export class IdentityDO extends withMcpSettlement(Agent<Env>) {
     // immediately (in-memory event, no alarm latency). Hibernating consumers
     // ignore the push and reconcile from the snapshot on their own wake.
     this.mcp.onServerStateChanged((change) => {
-      void this.fanout(change.serverId);
+      void this.fanout(change.serverId).catch((error) => {
+        console.error("[mcp-settlement-example] fanout failed:", error);
+      });
     });
   }
 
@@ -107,9 +111,18 @@ export class IdentityDO extends withMcpSettlement(Agent<Env>) {
     // never reaches ready (e.g. the user abandons OAuth), nothing inbound wakes
     // the owner, so the durable alarm fires a `timeout` to resolve the banner
     // with no watcher.
+    //
+    // `idempotencyKey` keeps this to ONE live watch per server: re-running
+    // /connect (a double click, a refresh, a reconnect) dedupes against the
+    // existing live intent instead of arming a second deadline and delivering
+    // `onServerSettled` twice — the foot-gun the key exists to prevent.
     const { intentId } = await this.watchMcpServerSettled(
       { serverId: id },
-      { callback: "onServerSettled", deadlineMs: 30_000 }
+      {
+        callback: "onServerSettled",
+        deadlineMs: 30_000,
+        idempotencyKey: `settle:${id}`
+      }
     );
     return { intentId };
   }
@@ -131,7 +144,11 @@ export class IdentityDO extends withMcpSettlement(Agent<Env>) {
   async armAbandonedAuthWatch(): Promise<{ intentId: string }> {
     const { intentId } = await this.watchMcpServerSettled(
       { url: "https://auth.example.com/never-completes" },
-      { callback: "onServerSettled", deadlineMs: 3_000 }
+      {
+        callback: "onServerSettled",
+        deadlineMs: 3_000,
+        idempotencyKey: "settle:abandoned-auth"
+      }
     );
     return { intentId };
   }
@@ -149,8 +166,8 @@ export class IdentityDO extends withMcpSettlement(Agent<Env>) {
    */
   async onServerSettled(result: MCPServerSettledResult): Promise<void> {
     await this.ctx.storage.put("lastSettlement", result);
-    // Push the latest connection snapshot (covers `settled`, where state +
-    // version advanced) AND the terminal settlement outcome. The outcome
+    // Push the latest connection snapshot (covers `settled`, where the state
+    // advanced) AND the terminal settlement outcome. The outcome
     // matters most for `timeout`: an abandoned-OAuth deadline fires with no
     // inbound transition, the connection snapshot still reads `authenticating`,
     // so the snapshot alone can't tell a consumer "this gave up" — only the
@@ -161,7 +178,7 @@ export class IdentityDO extends withMcpSettlement(Agent<Env>) {
 
   /** Durable, pollable snapshot — read by hibernating consumers on wake. */
   @callable()
-  getServerState(serverId: string) {
+  getServerState(serverId: string): MCPServerStateSnapshot | null {
     return this.mcp.getPersistedServerState(serverId) ?? null;
   }
 
@@ -207,13 +224,13 @@ export class IdentityDO extends withMcpSettlement(Agent<Env>) {
 
 /**
  * A consumer DO. While awake it accepts live pushes; on its own wake it
- * reconciles from the owner's durable snapshot. Both paths dedupe by `version`.
+ * reconciles from the owner's durable snapshot. Both paths are level-triggered:
+ * apply the latest state, idempotently.
  */
 export class WorkspaceDO extends Agent<Env> {
   private banner: Banner = {
     serverId: DEMO_SERVER_ID,
     state: null,
-    version: -1,
     via: "none",
     settlement: null
   };
@@ -223,29 +240,33 @@ export class WorkspaceDO extends Agent<Env> {
 
     // Poll-on-wake: reconcile whatever we missed while hibernating, then keep
     // taking live pushes. Nothing force-woke us — we pull on our own schedule.
+    // The three owner reads are independent, so fire them together rather than
+    // serially — `onStart` runs under `blockConcurrencyWhile`, so every wake of
+    // this consumer is gated on them completing.
     const owner = await getAgentByName(this.env.IdentityDO, "identity");
-    await owner.subscribe(this.name);
-    const snapshot = await owner.getServerState(DEMO_SERVER_ID);
-    if (snapshot) this.apply(snapshot, "poll-on-wake");
+    const [, snapshot, settlement] = await Promise.all([
+      owner.subscribe(this.name),
+      owner.getServerState(DEMO_SERVER_ID),
+      owner.getSettlementLog()
+    ]);
+
+    if (snapshot) await this.apply(snapshot, "poll-on-wake");
 
     // Reconcile the terminal settlement outcome on our own wake — the
     // hibernation-safe path for surfacing a `timeout` we slept through (no
     // force-wake required; we read the owner's durable record).
-    const settlement = await owner.getSettlementLog();
     if (settlement && this.banner.settlement !== settlement.type) {
       this.banner = { ...this.banner, settlement: settlement.type };
-      void this.ctx.storage.put("banner", this.banner);
+      // Await the durable write: the next wake reads this back, so it must land
+      // before we return (a floating put could be dropped on eviction).
+      await this.ctx.storage.put("banner", this.banner);
     }
   }
 
   /** Live fast-path target (called by the owner while we're awake). */
   @callable()
-  async applyLivePush(snapshot: {
-    serverId: string;
-    state: string | null;
-    version: number;
-  }): Promise<void> {
-    this.apply(snapshot, "live-push");
+  async applyLivePush(snapshot: MCPServerStateSnapshot): Promise<void> {
+    await this.apply(snapshot, "live-push");
   }
 
   /** Live fast-path target for a terminal settlement outcome (e.g. timeout). */
@@ -260,7 +281,8 @@ export class WorkspaceDO extends Agent<Env> {
       settlement: outcome.type,
       via: "live-push"
     };
-    void this.ctx.storage.put("banner", this.banner);
+    // Await: this banner is the durable record the next poll-on-wake reads.
+    await this.ctx.storage.put("banner", this.banner);
   }
 
   @callable()
@@ -268,23 +290,27 @@ export class WorkspaceDO extends Agent<Env> {
     return this.banner;
   }
 
-  private apply(
-    snapshot: { serverId: string; state: string | null; version: number },
+  private async apply(
+    snapshot: MCPServerStateSnapshot,
     via: Banner["via"]
-  ): void {
-    // The version cursor is shared by the live event and the snapshot, and the
-    // live event may repeat a version — so dedupe by it on both paths.
-    if (snapshot.version <= this.banner.version) return;
+  ): Promise<void> {
+    // Level-triggered: apply the latest state, idempotently. Re-applying the
+    // same state is a no-op render, so neither the live-push nor the
+    // poll-on-wake path needs an ordering cursor — a late older push is
+    // self-correcting on the next push/poll.
     // Spread to preserve a terminal `settlement` already recorded on the
     // banner — a snapshot update must not erase it.
     this.banner = {
       ...this.banner,
       serverId: snapshot.serverId,
       state: snapshot.state,
-      version: snapshot.version,
+      error: snapshot.error,
       via
     };
-    void this.ctx.storage.put("banner", this.banner);
+    // Await the durable write: it is the record the consumer's next wake reads,
+    // so it must persist before this turn returns rather than float and risk
+    // being dropped on eviction.
+    await this.ctx.storage.put("banner", this.banner);
   }
 }
 
@@ -304,8 +330,9 @@ export default {
       return json(await owner.connectMcp());
     }
     // Arm a watch on a server whose OAuth is never completed — the deadline
-    // alarm fires a durable `timeout` ~3s later with no watcher. Poll
-    // /owner/settlement afterwards to see `{ "type": "timeout" }`.
+    // alarm fires a durable `timeout` ~4s later (the 3s deadline + ~1s arm
+    // slack) with no watcher. Poll /owner/settlement afterwards to see
+    // `{ "type": "timeout" }`.
     if (url.pathname === "/connect-abandoned-auth") {
       return json(await owner.armAbandonedAuthWatch());
     }
@@ -324,12 +351,11 @@ export default {
       return json(await consumer.getBanner());
     }
 
+    // Anything else falls through to the SPA assets (the React UI). The Worker
+    // only runs first for the API routes above (see `run_worker_first`).
     return (
       (await routeAgentRequest(request, env, { cors: true })) ??
-      new Response(
-        "Routes: POST /connect, POST /connect-abandoned-auth, GET /owner/state, GET /owner/settlement, GET /workspace/:name",
-        { status: 404 }
-      )
+      new Response("Not found", { status: 404 })
     );
   }
 } satisfies ExportedHandler<Env>;

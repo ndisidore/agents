@@ -14,13 +14,12 @@ export type MCPServerRow = {
 /**
  * Row in the `cf_agents_mcp_server_state` sibling table — the durable,
  * pollable last-known connection state per server. Kept separate from
- * {@link MCPServerRow} so the monotonic `state_version` survives the
- * `INSERT OR REPLACE` rewrites of the config row.
+ * {@link MCPServerRow} so the snapshot survives the `INSERT OR REPLACE`
+ * rewrites of the config row.
  */
 export type MCPServerStateRow = {
   server_id: string;
   state: string | null;
   error: string | null;
-  version: number;
   updated_at: number;
 };

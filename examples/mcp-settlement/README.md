@@ -8,11 +8,11 @@ This pattern is what lets a real app delete its frontend readiness poll, its
 in-memory follow-up retry loop, and its DO-alarm backstop: the durable watch
 resolves the connection state **watched or not, hibernated or not** (including a
 `timeout` if the server never becomes ready), and consumers reconcile from the
-versioned snapshot on their own wake.
+durable snapshot on their own wake.
 
 > ⚠️ `withMcpSettlement` is experimental — the API may change between releases.
 
-> ℹ️ This is a deliberately minimal, single-file demo. Read
+> ℹ️ The UI and `src/server.ts` are a deliberately minimal demo. Read
 > [**What this is / isn't**](#what-this-is--isnt) before copying it — the live
 > fan-out here is a simplified illustration, not the production shape. The
 > production shape is sketched in
@@ -22,35 +22,39 @@ versioned snapshot on their own wake.
 
 ```bash
 pnpm install
-pnpm run dev
+pnpm run start
 ```
 
-No secrets required — the example bundles its own MCP server (`DemoMcpServer`),
-so the owner connects to it over a Durable Object binding (no external host or
-OAuth).
+Then open the printed URL. No secrets required — the example bundles its own MCP
+server (`DemoMcpServer`), so the owner connects to it over a Durable Object
+binding (no external host or OAuth).
 
-Then drive the scenario:
+The UI drives the owner/consumer topology: **Connect MCP** arms the durable
+watch, **Abandon OAuth** arms a short-deadline watch that resolves with a
+`timeout`, and the two cards show the owner's snapshot and a `WorkspaceDO`
+consumer's reconciled banner. The same flow is scriptable over HTTP:
 
 ```bash
 # Owner connects to the MCP server and arms a durable readiness watch.
-curl -X POST localhost:8787/connect
+curl -X POST localhost:5173/connect
 
 # The load-bearing case: arm a watch on a server whose OAuth is never completed.
 # Nothing inbound ever transitions it, so only the durable deadline alarm can
-# resolve it — ~3s later /owner/settlement reads { "type": "timeout" }, even if
-# the owner hibernated and no consumer was watching.
-curl -X POST localhost:8787/connect-abandoned-auth
+# resolve it — ~4s later (the 3s deadline + ~1s arm slack) /owner/settlement
+# reads { "type": "timeout" }, even if the owner hibernated and no consumer was
+# watching.
+curl -X POST localhost:5173/connect-abandoned-auth
 
-# The owner's durable, pollable snapshot { state, version }.
-curl localhost:8787/owner/state
+# The owner's durable, pollable snapshot { state }.
+curl localhost:5173/owner/state
 
 # The terminal decision recorded durably by onServerSettled.
-curl localhost:8787/owner/settlement
+curl localhost:5173/owner/settlement
 
 # A consumer's reconciled banner. First read subscribes the consumer and
 # reconciles from the owner snapshot + settlement log (poll-on-wake); the owner
 # also pushes live updates to subscribed consumers (see the caveat below).
-curl localhost:8787/workspace/alice
+curl localhost:5173/workspace/alice
 ```
 
 ## The three signals
@@ -82,9 +86,15 @@ export class IdentityDO extends withMcpSettlement(Agent<Env>) {
     const { id } = await this.addMcpServer("demo", this.env.DemoMcpServer, {
       id: "demo"
     });
+    // `idempotencyKey` keeps this to ONE live watch per server — a re-run of
+    // /connect dedupes instead of arming a second deadline + double delivery.
     return this.watchMcpServerSettled(
       { serverId: id },
-      { callback: "onServerSettled", deadlineMs: 30_000 }
+      {
+        callback: "onServerSettled",
+        deadlineMs: 30_000,
+        idempotencyKey: `settle:${id}`
+      }
     );
   }
 
@@ -94,12 +104,12 @@ export class IdentityDO extends withMcpSettlement(Agent<Env>) {
   }
 
   getServerState(id: string) {
-    return this.mcp.getPersistedServerState(id); // { state, version }
+    return this.mcp.getPersistedServerState(id); // { state }
   }
 }
 
-// Consumer — reconciles on its own wake, then takes live pushes; both dedupe
-// on the shared monotonic `version`.
+// Consumer — reconciles on its own wake, then takes live pushes; both are
+// level-triggered (apply the latest state, idempotently).
 export class WorkspaceDO extends Agent<Env> {
   async onStart() {
     const owner = await getAgentByName(this.env.IdentityDO, "identity");
@@ -117,11 +127,11 @@ provides, in the owner/consumer topology:
 - the **durable settlement watch** — `watchMcpServerSettled` → `onServerSettled`,
   which fires once the server settles _or_ the `deadlineMs` elapses (a
   `timeout`), surviving the **owner's** hibernation; and
-- the **versioned, pollable snapshot** — `getPersistedServerState()`, which a
-  hibernating **consumer** reconciles on its own wake.
+- the **level-triggered, pollable snapshot** — `getPersistedServerState()`, which
+  a hibernating **consumer** reconciles on its own wake.
 
 The source of truth is the durable settlement record (`/owner/settlement`) plus
-the versioned snapshot (`/owner/state`). The consumer banner is illustrative.
+the pollable snapshot (`/owner/state`). The consumer banner is illustrative.
 
 **It isn't** production cross-DO fan-out. Two deliberate simplifications keep it
 to one file, and both compromise the "awake fast-path":

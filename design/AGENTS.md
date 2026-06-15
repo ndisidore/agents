@@ -92,7 +92,7 @@ Keep it concise. A few paragraphs is fine. These are records, not essays.
 | `rfc-chat-recovery-work-budget.md`      | RFC        | Decouple chat-recovery duration from the runaway guard — work budget + `shouldKeepRecovering` (accepted)                               |
 | `rfc-chat-recovery-foundation.md`       | RFC        | Shared chat recovery foundation — internal engine, adapters, behavior convergence, and testing strategy                               |
 | `rfc-ai-chat-maintenance.md`            | RFC        | AIChatAgent first-class stance, shared chat toolkit, multi-session example direction                                                   |
-| `rfc-mcp-settlement-extraction.md`      | RFC        | Durable owner-DO MCP settlement (experimental mixin) + persisted `{state,version}` poll-on-wake enabler; cross-DO fan-out is app-level |
+| `rfc-mcp-settlement-extraction.md`      | RFC        | Durable owner-DO MCP settlement (experimental mixin) + persisted level-triggered `{state}` poll-on-wake enabler; cross-DO fan-out is app-level |
 | `loopback.md`                           | design doc | Loopback pattern — cross-boundary RPC for sub-agents and dynamic isolates                                                              |
 | `worker-bundler.md`                     | design doc | Worker bundler — host-side assets, no code generation, mounting is caller's concern                                                    |
 | `rfc-workers-ai-gateway-merge.md`       | RFC        | Merge ai-gateway-provider into workers-ai-provider — registry routing, universal run API, resume (proposed)                            |

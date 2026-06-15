@@ -20,7 +20,10 @@ import {
 } from "../../mcp/client-connection.ts";
 import type { MCPServerStateChange } from "../../mcp/client.ts";
 import { withMcpSettlement } from "../../experimental/mcp-settlement/index.ts";
-import type { MCPServerSettledResult } from "../../experimental/mcp-settlement/index.ts";
+import type {
+  MCPServerSettledResult,
+  MCPServerSettlementTarget
+} from "../../experimental/mcp-settlement/index.ts";
 
 type ToolExtraInfo = RequestHandlerExtra<ServerRequest, ServerNotification>;
 
@@ -1132,8 +1135,16 @@ export class TestMcpSettlementAgent extends withMcpSettlement(Agent) {
     this._recordedStateChanges = [];
   }
 
-  private settlementCallbackName(options?: SettlementWatchOptions): keyof this {
-    return (options?.callbackName ?? "onMcpSettlement") as keyof this;
+  private watchSettlement(
+    target: MCPServerSettlementTarget,
+    options?: SettlementWatchOptions
+  ): Promise<{ intentId: string; created: boolean }> {
+    return this.watchMcpServerSettled(target, {
+      callback: options?.callbackName ?? "onMcpSettlement",
+      deadlineMs: options?.deadlineMs,
+      idempotencyKey: options?.idempotencyKey,
+      states: options?.states
+    });
   }
 
   // Intentionally does NOT call super.onStart(): proves wake re-derivation
@@ -1210,15 +1221,7 @@ export class TestMcpSettlementAgent extends withMcpSettlement(Agent) {
     serverId: string,
     options?: SettlementWatchOptions
   ): Promise<{ intentId: string; created: boolean }> {
-    return this.watchMcpServerSettled(
-      { serverId },
-      {
-        callback: this.settlementCallbackName(options),
-        deadlineMs: options?.deadlineMs,
-        idempotencyKey: options?.idempotencyKey,
-        states: options?.states
-      }
-    );
+    return this.watchSettlement({ serverId }, options);
   }
 
   @callable()
@@ -1226,15 +1229,7 @@ export class TestMcpSettlementAgent extends withMcpSettlement(Agent) {
     url: string,
     options?: SettlementWatchOptions
   ): Promise<{ intentId: string; created: boolean }> {
-    return this.watchMcpServerSettled(
-      { url },
-      {
-        callback: this.settlementCallbackName(options),
-        deadlineMs: options?.deadlineMs,
-        idempotencyKey: options?.idempotencyKey,
-        states: options?.states
-      }
-    );
+    return this.watchSettlement({ url }, options);
   }
 
   @callable()
@@ -1243,15 +1238,7 @@ export class TestMcpSettlementAgent extends withMcpSettlement(Agent) {
     options?: SettlementWatchOptions
   ): Promise<string> {
     try {
-      await this.watchMcpServerSettled(
-        { url },
-        {
-          callback: this.settlementCallbackName(options),
-          deadlineMs: options?.deadlineMs,
-          idempotencyKey: options?.idempotencyKey,
-          states: options?.states
-        }
-      );
+      await this.watchSettlement({ url }, options);
       return "created";
     } catch (error) {
       return error instanceof Error ? error.message : String(error);
@@ -1291,6 +1278,52 @@ export class TestMcpSettlementAgent extends withMcpSettlement(Agent) {
     await this.onStart();
   }
 
+  // Insert a server config row with unparseable `server_options`, so the next
+  // restore (which `JSON.parse`s it) throws. No live connection is created.
+  @callable()
+  async seedCorruptServerOptionsForTest(
+    id: string,
+    url: string
+  ): Promise<void> {
+    this.sql`
+      INSERT OR REPLACE INTO cf_agents_mcp_servers (
+        id, name, server_url, client_id, auth_url, callback_url, server_options
+      ) VALUES (${id}, ${id}, ${url}, NULL, NULL, ${""}, ${"{not valid json"})
+    `;
+  }
+
+  // Write a stale `ready` durable snapshot row directly (no live connection),
+  // simulating a server that was ready before hibernation. Used to prove that a
+  // restore failure for that server still downgrades the stale snapshot.
+  @callable()
+  async seedReadySnapshotRowForTest(id: string): Promise<void> {
+    this.sql`
+      CREATE TABLE IF NOT EXISTS cf_agents_mcp_server_state (
+        server_id TEXT PRIMARY KEY NOT NULL,
+        state TEXT,
+        error TEXT,
+        updated_at INTEGER NOT NULL
+      )
+    `;
+    this.sql`
+      INSERT INTO cf_agents_mcp_server_state (server_id, state, error, updated_at)
+      VALUES (${id}, ${MCPConnectionState.READY}, NULL, ${Date.now()})
+      ON CONFLICT(server_id) DO UPDATE SET
+        state = excluded.state, updated_at = excluded.updated_at
+    `;
+  }
+
+  // Re-run the framework onStart wrapper with the restore latch reset, so
+  // `restoreConnectionsFromStorage` actually re-executes (and can throw on a
+  // corrupt row) rather than early-returning — exercising that the post-restore
+  // recovery hook still runs even when connection restore fails.
+  @callable()
+  async recoverWithRestoreRerunForTest(): Promise<void> {
+    (this.mcp as unknown as { _isRestored: boolean })._isRestored = false;
+    this._onStartRanWithoutSuper = false;
+    await this.onStart();
+  }
+
   @callable()
   async getPersistedServerStateForTest(serverId: string) {
     return this.mcp.getPersistedServerState(serverId) ?? null;
@@ -1325,7 +1358,7 @@ export class TestMcpSettlementAgent extends withMcpSettlement(Agent) {
   @callable()
   async simulateColdRestoreForTest(
     serverId: string
-  ): Promise<{ state: string | null; version: number }> {
+  ): Promise<{ state: string | null }> {
     for (const id of Object.keys(this.mcp.mcpConnections)) {
       delete this.mcp.mcpConnections[id];
     }
@@ -1336,7 +1369,7 @@ export class TestMcpSettlementAgent extends withMcpSettlement(Agent) {
     // the state — so the test observes the transitional snapshot the *restore
     // step itself* persisted, i.e. the W2.4 synchronous downgrade off `ready`.
     const snapshot = this.mcp.getPersistedServerState(serverId);
-    return { state: snapshot?.state ?? null, version: snapshot?.version ?? 0 };
+    return { state: snapshot?.state ?? null };
   }
 
   // Register a server with a pending OAuth authUrl, keeping the live (default
@@ -1423,7 +1456,7 @@ export class TestMcpSettlementAgent extends withMcpSettlement(Agent) {
 
   @callable()
   async getServerStateRowsForTest(): Promise<
-    { server_id: string; state: string | null; version: number }[]
+    { server_id: string; state: string | null }[]
   > {
     const stateTable = this.sql<{ name: string }>`
       SELECT name FROM sqlite_master
@@ -1433,29 +1466,10 @@ export class TestMcpSettlementAgent extends withMcpSettlement(Agent) {
     return this.sql<{
       server_id: string;
       state: string | null;
-      version: number;
     }>`
-      SELECT server_id, state, version FROM cf_agents_mcp_server_state
+      SELECT server_id, state FROM cf_agents_mcp_server_state
       ORDER BY server_id
     `;
-  }
-
-  @callable()
-  async backdateServerStateRow(serverId: string, ageMs: number): Promise<void> {
-    this.sql`
-      UPDATE cf_agents_mcp_server_state
-      SET updated_at = ${Date.now() - ageMs}
-      WHERE server_id = ${serverId}
-    `;
-  }
-
-  @callable()
-  async pruneServerStateTombstonesForTest(olderThanMs?: number): Promise<void> {
-    if (olderThanMs === undefined) {
-      this.mcp.pruneServerStateTombstones();
-    } else {
-      this.mcp.pruneServerStateTombstones(olderThanMs);
-    }
   }
 
   @callable()
@@ -1551,6 +1565,31 @@ export class TestMcpSettlementAgent extends withMcpSettlement(Agent) {
         ${intentId}, NULL, NULL, ${url}, ${"onMcpSettlement"},
         ${JSON.stringify([MCPConnectionState.READY])}, ${now + deadlineMs},
         ${"live"}, NULL, NULL, NULL, ${now}, NULL
+      )
+    `;
+  }
+
+  // The crash window, but keyed: a live intent with an idempotencyKey and a
+  // deadline whose alarm was never armed (no deadline_schedule_id). A retry with
+  // the same key (created:false) must repair the unarmed deadline. Default
+  // target states [READY, FAILED] so a default-options retry is compatible.
+  @callable()
+  async insertKeyedUnarmedDeadlineIntentForTest(
+    intentId: string,
+    url: string,
+    deadlineMs: number,
+    idempotencyKey: string
+  ): Promise<void> {
+    const now = Date.now();
+    this.sql`
+      INSERT INTO cf_agents_mcp_settlement_intents (
+        id, idempotency_key, server_id, url, callback, target_states,
+        deadline_at, status, result_json, delivery_schedule_id,
+        deadline_schedule_id, created_at, fired_at
+      ) VALUES (
+        ${intentId}, ${idempotencyKey}, NULL, ${url}, ${"onMcpSettlement"},
+        ${JSON.stringify([MCPConnectionState.READY, MCPConnectionState.FAILED])},
+        ${now + deadlineMs}, ${"live"}, NULL, NULL, NULL, ${now}, NULL
       )
     `;
   }

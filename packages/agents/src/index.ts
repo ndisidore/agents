@@ -2454,9 +2454,24 @@ export class Agent<
           }
 
           await this._tryCatch(async () => {
-            await this.mcp.restoreConnectionsFromStorage(this.name);
-            await this._restoreRpcMcpServers();
-            this.broadcastMcpServers();
+            // Isolate connection restore from the post-restore recovery hooks:
+            // restore is per-server resilient (a corrupt row is isolated inside
+            // restoreConnectionsFromStorage), but this outer guard is a backstop
+            // for any other restore-step throw (e.g. _restoreRpcMcpServers /
+            // broadcastMcpServers) — it must NOT skip the MCP-subsystem recovery
+            // below, which is the durable backstop for settlement watches
+            // (deadline re-arm / at-least-once redelivery). Log and continue; the
+            // hooks still run against whatever state restored.
+            try {
+              await this.mcp.restoreConnectionsFromStorage(this.name);
+              await this._restoreRpcMcpServers();
+              this.broadcastMcpServers();
+            } catch (error) {
+              console.error(
+                "[Agent] MCP connection restore failed on wake; running post-restore recovery anyway:",
+                error
+              );
+            }
 
             // Internal MCP-subsystem recovery (e.g. durable settlement
             // watches) runs here — not in user onStart — so it can't be

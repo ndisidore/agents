@@ -433,9 +433,11 @@ if (connectResult.state === "connected") {
 ### Event Subscription
 
 ```typescript
-// Listen for state changes (onServerStateChanged is an Event<void>)
-const disposable = this.mcp.onServerStateChanged(() => {
-  console.log("MCP server state changed");
+// Listen for state changes. onServerStateChanged carries a per-server payload
+// ({ serverId, url, state, error? }); state is the connection state, or the
+// sentinel "removed" emitted once when a server is removed.
+const disposable = this.mcp.onServerStateChanged((change) => {
+  console.log(`MCP server ${change.serverId} is now ${change.state}`);
   this.broadcastMcpServers(); // Notify connected clients
 });
 

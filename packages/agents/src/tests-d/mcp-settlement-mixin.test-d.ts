@@ -14,7 +14,6 @@ import { MCPConnectionState } from "../mcp/client-connection";
 
 class Settling extends withMcpSettlement(Agent<typeof env, {}>) {
   async onReady(_result: MCPServerSettledResult): Promise<void> {}
-  notACallback = 123;
 }
 
 const agent = new Settling(
