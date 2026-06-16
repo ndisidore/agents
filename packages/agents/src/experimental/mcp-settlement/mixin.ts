@@ -15,6 +15,18 @@ import type {
 const MCP_SETTLEMENT_INTENT_TTL_MS = 24 * 60 * 60 * 1000;
 
 /**
+ * Upper bound on how long wake recovery keeps the DO alive waiting for
+ * background MCP reconnects to settle before re-deriving. `restoreConnections-
+ * FromStorage` kicks off reconnects without awaiting them, so on a wake that
+ * only ran recovery the DO could otherwise hibernate before the reconnect
+ * reaches READY/FAILED — and a live watch would fall through to its deadline
+ * (timeout) instead of settling. 10s comfortably covers the default per-server
+ * retry budget (3 attempts, 500ms→5000ms backoff) while never pinning the DO
+ * open indefinitely.
+ */
+const MCP_SETTLEMENT_RECONNECT_SETTLE_MS = 10_000;
+
+/**
  * Constructor shape for an `Agent` (or `Agent` subclass) the mixin can wrap.
  * TypeScript requires a mixin base to expose a single `...args: any[]`
  * constructor; Durable Object classes are always constructed as `(ctx, env)`.
@@ -31,16 +43,16 @@ export interface McpSettlementMixin {
   /**
    * Register a durable watch that fires `opts.callback` once the targeted MCP
    * server reaches one of `opts.states` (default `[ready, failed]`), the
-   * optional `deadlineMs` elapses, or the watch is cancelled / the server is
-   * removed. Delivery is at-least-once and survives hibernation; callbacks must
-   * be idempotent.
+   * required `deadlineSeconds` elapses, or the watch is cancelled / the server
+   * is removed. Delivery is at-least-once and survives hibernation; callbacks
+   * must be idempotent.
    */
   watchMcpServerSettled<Callback extends keyof this>(
     target: MCPServerSettlementTarget,
     opts: {
       callback: Callback;
       states?: MCPConnectionState[];
-      deadlineMs?: number;
+      deadlineSeconds: number;
       idempotencyKey?: string;
     }
   ): Promise<{ intentId: string; created: boolean }>;
@@ -117,7 +129,7 @@ export function withMcpSettlement<TBase extends AgentConstructor>(
         })
       );
 
-      // Server removal cancels matching intents. The event fires before the
+      // Server removal cancels matching intents. The event fires after the
       // storage row is deleted and carries the last-known url so URL-targeted
       // intents still resolve.
       this._settlementDisposables.add(
@@ -149,8 +161,13 @@ export function withMcpSettlement<TBase extends AgentConstructor>(
     /**
      * Register a durable watch that fires `opts.callback` once the targeted MCP
      * server reaches one of `opts.states` (default `[ready, failed]`), the
-     * optional `deadlineMs` elapses (a `timeout` result), or the watch is
+     * required `deadlineSeconds` elapses (a `timeout` result), or the watch is
      * cancelled / the server is removed (a `cancelled` result).
+     *
+     * `deadlineSeconds` is required: every watch arms a durable deadline alarm.
+     * This guarantees the abandoned-OAuth case (nothing inbound ever wakes the
+     * owner) still resolves, and ensures every intent has a self-cleaning
+     * terminal path so live rows can never leak.
      *
      * Delivery is at-least-once and survives hibernation; callbacks must be
      * idempotent. Pass `idempotencyKey` to dedupe concurrent registrations.
@@ -160,7 +177,7 @@ export function withMcpSettlement<TBase extends AgentConstructor>(
       opts: {
         callback: Callback;
         states?: MCPConnectionState[];
-        deadlineMs?: number;
+        deadlineSeconds: number;
         idempotencyKey?: string;
       }
     ): Promise<{ intentId: string; created: boolean }> {
@@ -180,35 +197,53 @@ export function withMcpSettlement<TBase extends AgentConstructor>(
 
       const registration = this._settlement.registerSettlementIntent(target, {
         callback,
-        deadlineMs: opts.deadlineMs,
+        deadlineSeconds: opts.deadlineSeconds,
         idempotencyKey: opts.idempotencyKey,
         states: opts.states
       });
 
-      for (const delivery of registration.deliveries) {
-        await this._scheduleMcpSettlementDelivery(delivery);
-      }
+      if (registration.created) {
+        // Arm the deadline alarm BEFORE checking/settling current state. The
+        // store inserted the live row but deliberately did NOT settle, so there
+        // is no terminal write yet. Arming first means an armed alarm always
+        // bridges the (synchronous) terminal write and the (awaited) delivery
+        // schedule below: an eviction in that gap leaves the deadline armed, it
+        // fires, and recovery finds the terminal-but-undelivered row and
+        // redelivers. (Without this, an already-matching server settled with no
+        // alarm armed at all — the P1 lost-callback window.)
+        const pending = this._settlement.getPendingDeadline(
+          registration.intentId
+        );
+        if (pending) {
+          await this._scheduleMcpSettlementDeadline(pending);
+        }
 
-      if (
-        opts.deadlineMs !== undefined &&
-        registration.deliveries.length === 0
-      ) {
-        if (registration.created) {
-          await this._scheduleMcpSettlementDeadline({
-            deadlineAt: Date.now() + opts.deadlineMs,
-            intentId: registration.intentId
-          });
-        } else {
-          // Retry onto an existing live intent (same idempotencyKey). Repair a
-          // crash-window deadline that was never armed (intent persisted but the
-          // registration crashed before recording `deadline_schedule_id`) so we
-          // don't rely solely on the next wake — load-bearing for the
-          // abandoned-OAuth case, where the deadline alarm is the ONLY wake
-          // source. Re-arm from the intent's ORIGINAL `deadline_at` (not a fresh
-          // `now + deadlineMs`, which would extend it); the schedule is
-          // idempotent, so an already-armed deadline dedupes (no change), and an
-          // already-elapsed one is armed for the floor (~1s) and settles a
-          // timeout on the next alarm via the guarded handler.
+        // Now settle if the target already matches. The delivery cancels the
+        // deadline alarm we just armed (delivery-before-deadline-cancel order).
+        const delivery = this._settlement.checkSettlementNow(
+          registration.intentId
+        );
+        if (delivery) {
+          await this._scheduleMcpSettlementDelivery(delivery);
+        }
+      } else {
+        // Retry onto an existing live intent (same idempotencyKey). Its deadline
+        // was armed when it was first created, so the bridging alarm already
+        // exists. Schedule any synchronous match the store returned…
+        for (const delivery of registration.deliveries) {
+          await this._scheduleMcpSettlementDelivery(delivery);
+        }
+
+        // …and otherwise repair a crash-window deadline that was never armed
+        // (intent persisted but the original registration crashed before
+        // recording `deadline_schedule_id`) so we don't rely solely on the next
+        // wake — load-bearing for the abandoned-OAuth case, where the deadline
+        // alarm is the ONLY wake source. Re-arm from the intent's ORIGINAL
+        // `deadline_at` (not a fresh `now + deadlineSeconds`, which would extend
+        // it); the schedule is idempotent, so an already-armed deadline dedupes
+        // (no change), and an already-elapsed one is armed for the floor (~1s)
+        // and settles a timeout on the next alarm via the guarded handler.
+        if (registration.deliveries.length === 0) {
           const pending = this._settlement.getPendingDeadline(
             registration.intentId
           );
@@ -353,32 +388,74 @@ export function withMcpSettlement<TBase extends AgentConstructor>(
      * rows, so no separate housekeeping override is needed.
      */
     private async _recoverMcpSettlementIntents(): Promise<void> {
-      // Per-delivery / per-deadline isolation: a single failed re-arm must not
-      // abort recovery of the remaining intents — this path is the durable
-      // backstop for the whole feature.
-      for (const delivery of this._settlement.rederiveSettlementIntents()) {
-        try {
-          await this._scheduleMcpSettlementDelivery(delivery);
-        } catch (error) {
-          console.error(
-            `[mcp-settlement] failed to re-schedule delivery for intent "${delivery.intentId}":`,
-            error
-          );
-        }
-      }
+      // Re-arm live deadlines BEFORE re-deriving/settling. A registration that
+      // crashed after inserting the live intent but before recording its
+      // `deadline_schedule_id` leaves a live intent with no armed deadline. If
+      // recovery settled it first (server already in a target state), the
+      // resulting delivery would carry no deadline to bridge the terminal-write
+      // → delivery-schedule await, and the subsequent re-arm pass would skip it
+      // (it's terminal now) — so another eviction there could lose the callback
+      // with no alarm left to wake redelivery. Arming first (idempotent; an
+      // already-armed deadline dedupes) guarantees `settleIntent` reads a
+      // recorded `deadline_schedule_id`, so the delivery cancels it only AFTER
+      // the callback schedule lands — the bridge always holds.
+      await Promise.allSettled(
+        this._settlement.listLiveSettlementDeadlines().map((deadline) =>
+          this._scheduleMcpSettlementDeadline(deadline).catch((error) => {
+            console.error(
+              `[mcp-settlement] failed to re-arm deadline for intent "${deadline.intentId}":`,
+              error
+            );
+          })
+        )
+      );
 
-      for (const deadline of this._settlement.listLiveSettlementDeadlines()) {
-        try {
-          await this._scheduleMcpSettlementDeadline(deadline);
-        } catch (error) {
-          console.error(
-            `[mcp-settlement] failed to re-arm deadline for intent "${deadline.intentId}":`,
-            error
-          );
-        }
-      }
+      // Now re-derive against whatever state restored so far and settle matches.
+      await this._scheduleDerivedMcpSettlementDeliveries();
 
       this._settlement.pruneSettlementIntents(MCP_SETTLEMENT_INTENT_TTL_MS);
+
+      // Recovery runs right after restore, when restored connections are still
+      // CONNECTING (restoreConnectionsFromStorage starts the reconnect in the
+      // background without awaiting it). So the rederive above can't yet observe
+      // the final READY/FAILED. The awake `onServerStateChanged` fast-path would
+      // normally settle the watch once the reconnect lands — but on a wake that
+      // only ran recovery, nothing keeps the DO alive for the reconnect, so the
+      // watch could hibernate and fall through to its deadline (timeout). Anchor
+      // a bounded wait so the DO stays alive until the reconnects settle, then
+      // re-derive — turning a missed-transition timeout back into a real settle.
+      if (this._settlement.hasLiveSettlementIntents()) {
+        this.ctx.waitUntil(
+          this.mcp
+            .waitForConnections({ timeout: MCP_SETTLEMENT_RECONNECT_SETTLE_MS })
+            .then(() => this._scheduleDerivedMcpSettlementDeliveries())
+            .catch((error) => {
+              console.error(
+                "[mcp-settlement] post-reconnect re-derivation failed:",
+                error
+              );
+            })
+        );
+      }
+    }
+
+    /**
+     * @internal Re-derive settlement decisions from durable state and durably
+     * schedule each resulting delivery. Per-delivery isolation: one failed
+     * schedule must not abort the rest. Idempotent — safe to run repeatedly
+     * (on wake, and again after background reconnects settle).
+     */
+    private async _scheduleDerivedMcpSettlementDeliveries(): Promise<void> {
+      await Promise.allSettled(
+        this._settlement.rederiveSettlementIntents().map((delivery) =>
+          this._scheduleMcpSettlementDelivery(delivery).catch((error) => {
+            console.error(
+              `[mcp-settlement] failed to re-schedule delivery for intent "${delivery.intentId}":`,
+              error
+            );
+          })
+        )
+      );
     }
 
     protected _dropInternalTablesForDestroy(): void {

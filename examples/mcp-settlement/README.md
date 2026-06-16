@@ -2,21 +2,17 @@
 
 Demonstrates `agents/experimental/mcp-settlement` in the topology it's designed
 for: one Durable Object **owns** an MCP connection and other DOs **consume** its
-readiness, covering both awake and hibernating consumers.
+readiness, where the owner and each consumer **hibernate independently**.
 
-This pattern is what lets a real app delete its frontend readiness poll, its
-in-memory follow-up retry loop, and its DO-alarm backstop: the durable watch
-resolves the connection state **watched or not, hibernated or not** (including a
+That independent-hibernation split is the whole reason the feature exists. A
+consumer can be asleep when the connection settles, and the owner can be asleep
+when the consumer wakes and asks "is it ready yet?" — so neither side can hold an
+in-memory promise or listener that bridges the gap. The durable watch resolves
+the connection state **watched or not, hibernated or not** (including a
 `timeout` if the server never becomes ready), and consumers reconcile from the
-durable snapshot on their own wake.
+owner's durable status on their own wake.
 
 > ⚠️ `withMcpSettlement` is experimental — the API may change between releases.
-
-> ℹ️ The UI and `src/server.ts` are a deliberately minimal demo. Read
-> [**What this is / isn't**](#what-this-is--isnt) before copying it — the live
-> fan-out here is a simplified illustration, not the production shape. The
-> production shape is sketched in
-> [**Expanding to a production fan-out**](#expanding-to-a-production-fan-out-websockets).
 
 ## Run it
 
@@ -29,179 +25,95 @@ Then open the printed URL. No secrets required — the example bundles its own M
 server (`DemoMcpServer`), so the owner connects to it over a Durable Object
 binding (no external host or OAuth).
 
-The UI drives the owner/consumer topology: **Connect MCP** arms the durable
-watch, **Abandon OAuth** arms a short-deadline watch that resolves with a
-`timeout`, and the two cards show the owner's snapshot and a `WorkspaceDO`
-consumer's reconciled banner. The same flow is scriptable over HTTP:
+The UI shows the **Owner (`IdentityDO`)** plus **three Workspace
+(`WorkspaceDO`) consumers — A, B, and C** — each over its own `useAgent`
+WebSocket. The three workspaces are independent DO instances (by name); they all
+mirror the **same** owner status once it settles:
 
-```bash
-# Owner connects to the MCP server and arms a durable readiness watch.
-curl -X POST localhost:5173/connect
+- **Connect MCP** — owner connects + arms the durable watch. The owner panel
+  flips to `ready` instantly (its own state sync); every awake workspace tracks
+  it **live** (the owner pushes over the socket each workspace opened).
+- **Disconnect Auth** — simulates auth expiry: the owner drops the connection and
+  reports `authenticating`, so each workspace's **auth prompt re-appears**.
+- **Abandon OAuth** — arms a short-deadline watch on a server that never
+  connects; ~4s later (3s deadline + ~1s arm slack) the durable alarm fires a
+  `timeout` with no live transition, and the panels show it.
+- **Pause (sleep) / Resume (wake)** — per workspace. Pausing unmounts that
+  workspace's view, so it drops its socket to the owner and is free to
+  hibernate. Pause one workspace, change the owner (Connect / Disconnect Auth),
+  then Resume it: it **catches up via poll-on-wake** (its `via` shows
+  `poll-on-wake`) while the workspaces that stayed awake updated via
+  `live-push`. Same final state, two different paths to it.
 
-# The load-bearing case: arm a watch on a server whose OAuth is never completed.
-# Nothing inbound ever transitions it, so only the durable deadline alarm can
-# resolve it — ~4s later (the 3s deadline + ~1s arm slack) /owner/settlement
-# reads { "type": "timeout" }, even if the owner hibernated and no consumer was
-# watching.
-curl -X POST localhost:5173/connect-abandoned-auth
+## How a workspace learns of readiness/settlement
 
-# The owner's durable, pollable snapshot { state }.
-curl localhost:5173/owner/state
+The mixin is an **owner-DO** primitive; routing to consumers is app code. The
+key invariant: **a workspace may wake the owner, but the owner never wakes a
+workspace.** This example wires three signals around that:
 
-# The terminal decision recorded durably by onServerSettled.
-curl localhost:5173/owner/settlement
+| Signal                 | Who                  | Mechanism                                                                              |
+| ---------------------- | -------------------- | -------------------------------------------------------------------------------------- |
+| Durable readiness gate | owner                | `watchMcpServerSettled` → `onServerSettled` (survives owner hibernation)               |
+| Awake fast-path        | awake consumer       | consumer opens a WS **to** the owner; owner `broadcast`s over its open sockets         |
+| Poll-on-wake           | hibernating consumer | consumer reads the owner's durable status on its own wake (`onStart` / on socket open) |
 
-# A consumer's reconciled banner. First read subscribes the consumer and
-# reconciles from the owner snapshot + settlement log (poll-on-wake); the owner
-# also pushes live updates to subscribed consumers (see the caveat below).
-curl localhost:5173/workspace/alice
-```
-
-## The three signals
-
-The mixin is an **owner-DO** primitive; routing to consumers is app code. This
-example wires all three pieces:
-
-| Signal                 | Who                  | Mechanism                                                                |
-| ---------------------- | -------------------- | ------------------------------------------------------------------------ |
-| Durable readiness gate | owner                | `watchMcpServerSettled` → `onServerSettled` (survives owner hibernation) |
-| Awake fast-path        | awake consumer       | owner relays `this.mcp.onServerStateChanged` (in-memory, immediate)¹     |
-| Poll-on-wake           | hibernating consumer | consumer reads `owner.getServerState()` + settlement log on its own wake |
-
-¹ In this example the relay is a cross-DO **RPC** (`getAgentByName(...).call`),
-which **force-wakes** the consumer and is held in an **in-memory** subscriber
-set on the owner. That keeps the example to one file, but it is not the
-hibernation-respecting fast-path the topology wants — see below.
+The awake fast-path is **consumer-initiated**, which is what makes it safe: the
+workspace opens the socket (it may wake the owner — allowed), and the owner only
+ever `broadcast`s over **already-open** sockets. A hibernating workspace has no
+socket, so the broadcast skips it — it is **never force-woken**, and catches up
+via poll-on-wake instead.
 
 ```ts
-// Owner — holds the connection, arms a durable watch, relays live changes.
-export class IdentityDO extends withMcpSettlement(Agent<Env>) {
-  constructor(ctx: AgentContext, env: Env) {
-    super(ctx, env);
-    // Awake fast-path: relay live transitions to subscribed consumers.
-    this.mcp.onServerStateChanged((change) => this.fanout(change.serverId));
-  }
-
-  async connectMcp() {
-    const { id } = await this.addMcpServer("demo", this.env.DemoMcpServer, {
-      id: "demo"
-    });
-    // `idempotencyKey` keeps this to ONE live watch per server — a re-run of
-    // /connect dedupes instead of arming a second deadline + double delivery.
-    return this.watchMcpServerSettled(
-      { serverId: id },
-      {
-        callback: "onServerSettled",
-        deadlineMs: 30_000,
-        idempotencyKey: `settle:${id}`
-      }
-    );
-  }
-
-  // Durable gate — fires once the server settles, even across owner hibernation.
-  async onServerSettled(result: MCPServerSettledResult) {
-    /* record + fan out the first ready/failed signal */
-  }
-
-  getServerState(id: string) {
-    return this.mcp.getPersistedServerState(id); // { state }
-  }
-}
-
-// Consumer — reconciles on its own wake, then takes live pushes; both are
-// level-triggered (apply the latest state, idempotently).
-export class WorkspaceDO extends Agent<Env> {
-  async onStart() {
-    const owner = await getAgentByName(this.env.IdentityDO, "identity");
-    await owner.subscribe(this.name);
-    this.apply(await owner.getServerState("demo"), "poll-on-wake");
-  }
-}
-```
-
-## What this is / isn't
-
-**It is** a minimal, runnable demo of the two guarantees the SDK actually
-provides, in the owner/consumer topology:
-
-- the **durable settlement watch** — `watchMcpServerSettled` → `onServerSettled`,
-  which fires once the server settles _or_ the `deadlineMs` elapses (a
-  `timeout`), surviving the **owner's** hibernation; and
-- the **level-triggered, pollable snapshot** — `getPersistedServerState()`, which
-  a hibernating **consumer** reconciles on its own wake.
-
-The source of truth is the durable settlement record (`/owner/settlement`) plus
-the pollable snapshot (`/owner/state`). The consumer banner is illustrative.
-
-**It isn't** production cross-DO fan-out. Two deliberate simplifications keep it
-to one file, and both compromise the "awake fast-path":
-
-1. **The subscriber registry is in-memory** (`private subscribers = new Set()`),
-   so it is **lost when the owner hibernates**. A consumer that subscribed
-   before the owner slept won't receive live pushes after the owner wakes — it
-   only recovers on its own next poll-on-wake.
-2. **The live push is a cross-DO RPC, which force-wakes the consumer.** That
-   contradicts the goal of "notify awake consumers without waking hibernating
-   ones." It's fine for a demo, but a real app should not wake a hibernating
-   consumer just to tell it something it will re-read on its next wake anyway.
-
-The genuinely hibernation-safe paths here are the **durable watch** (owner side)
-and **poll-on-wake** (consumer side). Treat the live RPC push as a convenience.
-
-## Expanding to a production fan-out (WebSockets)
-
-To make the awake fast-path both survive owner hibernation **and** reach only
-already-awake consumers (no force-wake), model subscriptions as **hibernatable
-WebSocket connections** instead of an in-memory set + RPC. Sketch:
-
-```ts
-// Consumer: open a hibernatable WS to the owner on its own wake, and
-// re-establish it after its own hibernation. Tag it with the consumer's name.
-export class WorkspaceDO extends Agent<Env> {
-  async onStart() {
-    const owner = await getAgentByName(this.env.IdentityDO, "identity");
-    // Reconcile what we missed while asleep (durable, no force-wake)...
-    this.apply(await owner.getServerState("demo"), "poll-on-wake");
-    // ...then (re)subscribe over a WebSocket for the awake fast-path.
-    await connectWebSocket(owner, `/subscribe?consumer=${this.name}`);
-  }
-  // Pushes arrive as WS messages while we're awake; if we hibernate the socket
-  // drops and we silently miss them — poll-on-wake covers the gap.
-}
-
-// Owner: accept the WS as a hibernatable connection (routeAgentRequest already
-// wires this), and broadcast over LIVE connections — which survive the owner's
-// hibernation (`ctx.getWebSockets()` / partyserver `getConnections()`).
-export class IdentityDO extends withMcpSettlement(Agent<Env>) {
+// Owner — holds the connection + watch, publishes status as its own Agent state,
+// and pushes status changes to whichever workspaces have a socket open (one
+// broadcast fans out to all of them). It never reaches into a workspace.
+export class IdentityDO extends withMcpSettlement(Agent<Env, OwnerStatus>) {
   constructor(ctx, env) {
     super(ctx, env);
-    this.mcp.onServerStateChanged((change) =>
-      this.broadcastSnapshot(change.serverId)
-    );
+    this.mcp.onServerStateChanged(() => this.publish()); // owner-local event
   }
-  async onServerSettled(result) {
-    this.broadcastSettlement(result); // includes `timeout`
+  private publish(patch = {}) {
+    const next = /* recompute from getPersistedServerState() + flags */;
+    this.setState(next); // → owner panel (native state sync)
+    this.broadcast(JSON.stringify({ type: "owner-status", status: next })); // → workspaces
   }
-  private broadcastSnapshot(serverId: string) {
-    const snapshot = this.mcp.getPersistedServerState(serverId);
-    // Only reaches consumers whose socket is alive (i.e. awake). A hibernated
-    // consumer's socket is gone, so this is a no-op for it — no force-wake.
-    for (const conn of this.getConnections())
-      conn.send(JSON.stringify(snapshot));
+}
+
+// Consumer — opens a socket to the owner while a browser is viewing it (awake),
+// applies pushes into durable Agent state (also synced live to its browser), and
+// reconciles on its own wake. Level-triggered: apply the latest, idempotently.
+export class WorkspaceDO extends Agent<Env, { banner: Banner }> {
+  async onStart() {
+    await this.reconcile("poll-on-wake"); // backfill what we missed asleep
+  }
+  async onConnect() {
+    await this.openOwnerSocket(); // we initiate → owner may wake; that's fine
+    await this.reconcile("poll-on-wake");
+  }
+  onClose(connection) {
+    // last viewer gone → drop the socket so the owner can't reach (or wake) us
+    if (![...this.getConnections()].some((c) => c.id !== connection.id)) {
+      this.closeOwnerSocket();
+    }
   }
 }
 ```
 
-Key properties this buys over the in-file version:
+The `deadlineSeconds` → `timeout` is the part no push or snapshot can cover: if a
+server never reaches a target state (abandoned OAuth), nothing inbound wakes the
+owner, so only the durable alarm can resolve it. That's why the watch is the
+primitive and the live/poll paths are complements, not substitutes.
 
-- the subscriber set is the **live connection set**, which the runtime preserves
-  across the **owner's** hibernation (no in-memory registry to lose);
-- a push reaches **only awake consumers** — a hibernated consumer's socket is
-  closed, so the push silently drops and that consumer reconciles via
-  poll-on-wake on its own schedule (**never force-woken**).
+## Simulating hibernation in the demo
 
-The durable watch and the snapshot are unchanged — only the fast-path transport
-moves from RPC to WebSockets.
+All three workspaces are on screen at once, so all three are awake and holding a
+live socket to the owner — none would naturally hibernate while you watch them.
+**Pause** stands in for hibernation: it drops a workspace's connection (and the
+socket it opened to the owner), so that workspace behaves like one that isn't
+being viewed. **Resume** reconciles it from the owner's durable status via
+poll-on-wake — exactly what a workspace does when it actually wakes from
+hibernation. The owner holds the durable settlement watch and survives its own
+hibernation regardless.
 
 ## Related
 

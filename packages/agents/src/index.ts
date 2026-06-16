@@ -10574,22 +10574,31 @@ export class Agent<
         continue;
       }
 
-      const opts: { bindingName: string; props?: Record<string, unknown> } =
-        server.server_options ? JSON.parse(server.server_options) : {};
-
-      const namespace = (this.env as Record<string, unknown>)[
-        opts.bindingName
-      ] as DurableObjectNamespace<McpAgent> | undefined;
-      if (!namespace) {
-        console.warn(
-          `[Agent] Cannot restore RPC MCP server "${server.name}": binding "${opts.bindingName}" not found in env`
-        );
-        continue;
-      }
-
-      const normalizedName = server.server_url.replace(RPC_DO_PREFIX, "");
-
+      // Per-server isolation: a single unrestorable RPC server (corrupt
+      // `server_options`, a binding renamed/removed by a deploy, or a connect
+      // failure) must not abort restore for the rest. On any failure, downgrade
+      // THIS server's durable snapshot off any stale pre-hibernation `ready`
+      // value — with no live connection `_resolveServerState` resolves to
+      // `null`, so a cross-DO consumer polling after wake doesn't read a
+      // connection that was never restored. (The JSON.parse is INSIDE the try
+      // for the same reason: a corrupt row must not throw past this loop.)
       try {
+        const opts: { bindingName: string; props?: Record<string, unknown> } =
+          server.server_options ? JSON.parse(server.server_options) : {};
+
+        const namespace = (this.env as Record<string, unknown>)[
+          opts.bindingName
+        ] as DurableObjectNamespace<McpAgent> | undefined;
+        if (!namespace) {
+          console.warn(
+            `[Agent] Cannot restore RPC MCP server "${server.name}": binding "${opts.bindingName}" not found in env`
+          );
+          this._downgradeRpcServerSnapshot(server.id);
+          continue;
+        }
+
+        const normalizedName = server.server_url.replace(RPC_DO_PREFIX, "");
+
         await this.mcp.connect(`${RPC_DO_PREFIX}${normalizedName}`, {
           reconnect: { id: server.id },
           transport: {
@@ -10609,7 +10618,23 @@ export class Agent<
           `[Agent] Error restoring RPC MCP server "${server.name}":`,
           error
         );
+        this._downgradeRpcServerSnapshot(server.id);
       }
+    }
+  }
+
+  /**
+   * Downgrade a server's durable snapshot off a stale `ready` after a failed
+   * RPC restore. Guarded so a notify failure can't re-abort the restore loop.
+   */
+  private _downgradeRpcServerSnapshot(serverId: string): void {
+    try {
+      this.mcp.notifyServerStateChanged(serverId);
+    } catch (notifyError) {
+      console.error(
+        `[Agent] Failed to downgrade snapshot for RPC server "${serverId}" after restore failure:`,
+        notifyError
+      );
     }
   }
 

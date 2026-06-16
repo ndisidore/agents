@@ -44,7 +44,7 @@ describe("durable MCP settlement watches", () => {
     );
 
     const watch = await stub.createSettlementWatchByServerId("ready-server", {
-      deadlineMs: 60_000
+      deadlineSeconds: 60
     });
     expect(watch.created).toBe(true);
 
@@ -83,7 +83,7 @@ describe("durable MCP settlement watches", () => {
     );
     const watch = await stub.createSettlementWatchByServerId(
       "transition-server",
-      { deadlineMs: 60_000 }
+      { deadlineSeconds: 60 }
     );
 
     let rows = await stub.getSettlementIntentRows();
@@ -125,7 +125,7 @@ describe("durable MCP settlement watches", () => {
       MCPConnectionState.CONNECTED
     );
     const watch = await stub.createSettlementWatchByServerId("dbc-server", {
-      deadlineMs: 60_000
+      deadlineSeconds: 60
     });
     expect(
       (await stub.getSettlementIntentRows())[0].deadline_schedule_id
@@ -167,7 +167,7 @@ describe("durable MCP settlement watches", () => {
 
     const watch = await stub.createSettlementWatchByUrl(
       "https://mcp.example.com/timeout",
-      { deadlineMs: 60_000 }
+      { deadlineSeconds: 60 }
     );
     let rows = await stub.getSettlementIntentRows();
     const deadlineScheduleId = rows[0].deadline_schedule_id;
@@ -186,10 +186,60 @@ describe("durable MCP settlement watches", () => {
         MCPConnectionState.READY,
         MCPConnectionState.FAILED
       ]);
+      // The timeout result reports the deadline in seconds.
+      expect(typeof results[0].deadlineSeconds).toBe("number");
     }
 
     rows = await stub.getSettlementIntentRows();
     expect(rows[0].status).toBe("timeout");
+  });
+
+  it("rejects a watch with no deadline (deadlineSeconds is required)", async () => {
+    const stub = await settlementAgent("require-deadline");
+
+    await stub.seedMcpServer(
+      "rd-server",
+      "https://mcp.example.com/rd",
+      MCPConnectionState.CONNECTED
+    );
+
+    const message =
+      await stub.createSettlementWatchWithoutDeadlineForTest("rd-server");
+    expect(message).toContain("deadlineSeconds");
+
+    // No intent row is persisted when registration is rejected.
+    const rows = await stub.getSettlementIntentRows();
+    expect(rows).toHaveLength(0);
+  });
+
+  it("settles as timeout (not settled) when a target state is reached after the deadline", async () => {
+    const stub = await settlementAgent("deadline-authoritative");
+
+    await stub.seedMcpServer(
+      "da-server",
+      "https://mcp.example.com/da",
+      MCPConnectionState.CONNECTED
+    );
+    const watch = await stub.createSettlementWatchByServerId("da-server", {
+      deadlineSeconds: 60
+    });
+
+    // The deadline elapses while the server is still merely CONNECTED (not yet
+    // a watched target state).
+    await stub.expireSettlementDeadline(watch.intentId);
+
+    // The server now reaches READY — but the deadline already passed, so the
+    // authoritative outcome is `timeout`, never a late `settled`.
+    await stub.makeServerReadyThroughDiscovery("da-server");
+    const row = await waitForSettlementSchedule(stub, watch.intentId);
+    expect(row.status).toBe("timeout");
+    expect(row.deadline_schedule_id).toBeNull();
+
+    await runDurableObjectAlarm(stub);
+
+    const results = await stub.getSettlementResults();
+    expect(results).toHaveLength(1);
+    expect(results[0].type).toBe("timeout");
   });
 
   it("cancels explicit watches and server-removal watches durably", async () => {
@@ -202,7 +252,7 @@ describe("durable MCP settlement watches", () => {
     );
     const explicit = await stub.createSettlementWatchByServerId(
       "cancel-server",
-      { deadlineMs: 60_000 }
+      { deadlineSeconds: 60 }
     );
     await stub.cancelSettlementWatchForTest(explicit.intentId);
 
@@ -212,7 +262,7 @@ describe("durable MCP settlement watches", () => {
 
     const removal = await stub.createSettlementWatchByUrl(
       "https://mcp.example.com/cancel",
-      { deadlineMs: 60_000 }
+      { deadlineSeconds: 60 }
     );
     await stub.removeMcpServerForSettlementTest("cancel-server");
 
@@ -313,11 +363,168 @@ describe("durable MCP settlement watches", () => {
     ).not.toBe(MCPConnectionState.READY);
   });
 
+  it("downgrades a stale RPC snapshot when the binding is missing on restore", async () => {
+    // A deploy that renames/removes the binding leaves the rpc: config row
+    // pointing at a binding absent from env. The RPC restore must downgrade the
+    // stale pre-hibernation `ready` snapshot rather than serving a connection
+    // that was never restored to a poll-on-wake consumer.
+    const stub = await settlementAgent("rpc-missing-binding");
+
+    await stub.seedRpcServerRowForTest(
+      "rpc-gone",
+      "rpc-gone",
+      "BINDING_THAT_DOES_NOT_EXIST"
+    );
+    await stub.seedReadySnapshotRowForTest("rpc-gone");
+    expect((await stub.getPersistedServerStateForTest("rpc-gone"))?.state).toBe(
+      MCPConnectionState.READY
+    );
+
+    await stub.restoreRpcServersForTest();
+
+    expect(
+      (await stub.getPersistedServerStateForTest("rpc-gone"))?.state
+    ).not.toBe(MCPConnectionState.READY);
+  });
+
+  it("isolates a corrupt RPC server row on restore without aborting the loop", async () => {
+    // A corrupt rpc: row (unparseable server_options) must be isolated inside
+    // the per-server try — its own stale `ready` snapshot is downgraded, and a
+    // sibling RPC row later in iteration order is unaffected.
+    const stub = await settlementAgent("rpc-corrupt");
+
+    await stub.seedRpcServerRowForTest(
+      "rpc-corrupt-row",
+      "rpc-corrupt-row",
+      "X",
+      {
+        corruptOptions: true
+      }
+    );
+    await stub.seedReadySnapshotRowForTest("rpc-corrupt-row");
+    await stub.seedRpcServerRowForTest(
+      "rpc-sibling",
+      "rpc-sibling",
+      "ALSO_MISSING"
+    );
+    await stub.seedReadySnapshotRowForTest("rpc-sibling");
+
+    await stub.restoreRpcServersForTest();
+
+    // Both rows were downgraded — the corrupt one did not throw past the loop
+    // and strand the sibling at a stale `ready`.
+    expect(
+      (await stub.getPersistedServerStateForTest("rpc-corrupt-row"))?.state
+    ).not.toBe(MCPConnectionState.READY);
+    expect(
+      (await stub.getPersistedServerStateForTest("rpc-sibling"))?.state
+    ).not.toBe(MCPConnectionState.READY);
+  });
+
+  it("creates independent intents for concurrent watches with different keys", async () => {
+    const stub = await settlementAgent("concurrent-keys");
+
+    await stub.seedMcpServer(
+      "ck-server",
+      "https://mcp.example.com/ck",
+      MCPConnectionState.CONNECTING
+    );
+
+    const [a, b] = await Promise.all([
+      stub.createSettlementWatchByServerId("ck-server", {
+        deadlineSeconds: 60,
+        idempotencyKey: "key-a"
+      }),
+      stub.createSettlementWatchByServerId("ck-server", {
+        deadlineSeconds: 60,
+        idempotencyKey: "key-b"
+      })
+    ]);
+
+    expect(a.created).toBe(true);
+    expect(b.created).toBe(true);
+    expect(a.intentId).not.toBe(b.intentId);
+
+    const rows = await stub.getSettlementIntentRows();
+    expect(rows).toHaveLength(2);
+    expect(new Set(rows.map((r) => r.idempotency_key))).toEqual(
+      new Set(["key-a", "key-b"])
+    );
+  });
+
+  it("fires timeout for a 1s deadline (small-deadline flooring path)", async () => {
+    const stub = await settlementAgent("one-second-deadline");
+
+    const watch = await stub.createSettlementWatchByUrl(
+      "https://mcp.example.com/1s",
+      { deadlineSeconds: 1 }
+    );
+    let rows = await stub.getSettlementIntentRows();
+    const deadlineScheduleId = rows[0].deadline_schedule_id;
+    expect(deadlineScheduleId).toBeTruthy();
+
+    await stub.expireSettlementDeadline(watch.intentId);
+    await stub.backdateSchedule(deadlineScheduleId!, 1);
+    await runDurableObjectAlarm(stub);
+    await runDurableObjectAlarm(stub);
+
+    const results = await stub.getSettlementResults();
+    expect(results).toHaveLength(1);
+    expect(results[0].type).toBe("timeout");
+    if (results[0].type === "timeout") {
+      // (`expireSettlementDeadline` backdates `deadline_at`, so the reported
+      // `deadlineSeconds` reflects that floor rather than the original 1.)
+      expect(typeof results[0].deadlineSeconds).toBe("number");
+    }
+
+    rows = await stub.getSettlementIntentRows();
+    expect(rows[0].status).toBe("timeout");
+  });
+
+  it("resolves a URL-targeted watch against duplicate server URLs", async () => {
+    const stub = await settlementAgent("duplicate-urls");
+
+    // Two servers share the same URL (distinct ids). A URL-targeted watch must
+    // resolve to a match and settle rather than throw or hang.
+    await stub.seedMcpServer(
+      "dup-a",
+      "https://mcp.example.com/dup",
+      MCPConnectionState.READY
+    );
+    await stub.seedMcpServer(
+      "dup-b",
+      "https://mcp.example.com/dup",
+      MCPConnectionState.READY
+    );
+
+    const watch = await stub.createSettlementWatchByUrl(
+      "https://mcp.example.com/dup"
+    );
+
+    await waitForSettlementSchedule(stub, watch.intentId);
+    const rows = await stub.getSettlementIntentRows();
+    expect(rows.find((r) => r.id === watch.intentId)?.status).toBe("settled");
+  });
+
+  it("rejects deadlineSeconds beyond the 30-day cap", async () => {
+    const stub = await settlementAgent("deadline-cap");
+
+    const thirtyDaysPlusOne = 30 * 24 * 60 * 60 + 1;
+    const message = await stub.tryCreateSettlementWatchByUrl(
+      "https://mcp.example.com/cap",
+      { deadlineSeconds: thirtyDaysPlusOne }
+    );
+    expect(message).toContain("30 days");
+
+    // No intent row was created for the rejected watch.
+    expect(await stub.getSettlementIntentRows()).toHaveLength(0);
+  });
+
   it("re-arms a deadline that fires early with a fresh future-dated schedule", async () => {
     const stub = await settlementAgent("deadline-early");
 
     await stub.createSettlementWatchByUrl("https://mcp.example.com/early", {
-      deadlineMs: 60_000
+      deadlineSeconds: 60
     });
     let rows = await stub.getSettlementIntentRows();
     const firstScheduleId = rows[0].deadline_schedule_id;
@@ -442,6 +649,118 @@ describe("durable MCP settlement watches", () => {
     // Removal deletes the durable snapshot row.
     await stub.removeMcpServerForSettlementTest("ps-server");
     expect(await stub.getPersistedServerStateForTest("ps-server")).toBeNull();
+  });
+
+  it("refreshes the durable snapshot when a connection is closed but the server stays registered", async () => {
+    const stub = await settlementAgent("close-refresh");
+
+    await stub.seedMcpServer(
+      "cr-server",
+      "https://mcp.example.com/cr",
+      MCPConnectionState.CONNECTED
+    );
+    await stub.makeServerReadyThroughDiscovery("cr-server");
+    expect(
+      (await stub.getPersistedServerStateForTest("cr-server"))?.state
+    ).toBe(MCPConnectionState.READY);
+
+    // Close the connection WITHOUT removing the server. The snapshot must no
+    // longer report `ready` — a poll-on-wake consumer would otherwise treat a
+    // closed connection as live.
+    await stub.closeMcpConnectionForTest("cr-server");
+
+    const snapshot = await stub.getPersistedServerStateForTest("cr-server");
+    // Server is still registered (close ≠ remove), so the snapshot row remains,
+    // but its state is no longer `ready`.
+    expect(snapshot).not.toBeNull();
+    expect(snapshot!.state).not.toBe(MCPConnectionState.READY);
+  });
+
+  it("fires onServerStateChanged on a close downgrade so live subscribers refresh", async () => {
+    // A downgrade to no-live-connection (close) must EMIT, not just update the
+    // snapshot — otherwise awake subscribers (broadcastMcpServers / a consumer
+    // DO's publish) never re-run and keep showing a stale `ready`.
+    const stub = await settlementAgent("close-emits");
+    await stub.seedMcpServer(
+      "ce-server",
+      "https://mcp.example.com/ce",
+      MCPConnectionState.CONNECTED
+    );
+    await stub.makeServerReadyThroughDiscovery("ce-server");
+
+    await stub.clearRecordedStateChanges();
+    await stub.closeMcpConnectionForTest("ce-server");
+
+    const changes = await stub.getRecordedStateChanges();
+    const ceChanges = changes.filter((c) => c.serverId === "ce-server");
+    expect(ceChanges.length).toBeGreaterThan(0);
+    // The downgrade carries a non-ready (null) state.
+    expect(ceChanges.at(-1)!.state).not.toBe(MCPConnectionState.READY);
+  });
+
+  it("downgrades the snapshot even when connection.close() rejects", async () => {
+    const stub = await settlementAgent("close-rejects");
+    await stub.seedMcpServer(
+      "crj-server",
+      "https://mcp.example.com/crj",
+      MCPConnectionState.CONNECTED
+    );
+    await stub.makeServerReadyThroughDiscovery("crj-server");
+    expect(
+      (await stub.getPersistedServerStateForTest("crj-server"))?.state
+    ).toBe(MCPConnectionState.READY);
+
+    // close() rejects, but the in-memory connection is still torn down in the
+    // finally — so the snapshot must be refreshed off `ready` there too.
+    const { threw } =
+      await stub.closeMcpConnectionExpectingThrowForTest("crj-server");
+    expect(threw).toBe(true);
+
+    const snapshot = await stub.getPersistedServerStateForTest("crj-server");
+    expect(snapshot).not.toBeNull();
+    expect(snapshot!.state).not.toBe(MCPConnectionState.READY);
+  });
+
+  it("arms the deadline before settling a matching intent on recovery (bridge)", async () => {
+    // P1: a registration that crashed after inserting the live intent but before
+    // recording deadline_schedule_id leaves a live intent with no armed alarm.
+    // Recovery must arm the deadline BEFORE re-deriving/settling, so that if the
+    // server already matches and recovery is then evicted before scheduling the
+    // delivery, an armed deadline alarm still bridges the gap and wakes
+    // redelivery.
+    const stub = await settlementAgent("recovery-arm-before-settle");
+    await stub.seedMcpServer(
+      "rab-server",
+      "https://mcp.example.com/rab",
+      MCPConnectionState.READY
+    );
+    await stub.insertLiveServerDeadlineIntentWithoutScheduleForTest(
+      "rab-live",
+      "rab-server",
+      60_000
+    );
+
+    // Arm-then-rederive, but stop before scheduling the delivery (the eviction
+    // window). With the fix, the now-terminal intent carries an armed deadline.
+    await stub.recoverArmThenRederiveWithoutDeliveryForTest();
+
+    const rows = await stub.getSettlementIntentRows();
+    const row = rows.find((r) => r.id === "rab-live")!;
+    expect(row.status).toBe("settled");
+    expect(row.delivery_schedule_id).toBeNull(); // delivery not scheduled yet
+    expect(row.deadline_schedule_id).toBeTruthy(); // …but a bridging alarm IS armed
+    const deadlineSchedules = (await stub.getSettlementScheduleRows()).filter(
+      (s) => s.callback === "_cf_checkMcpSettlementIntentDeadline"
+    );
+    expect(deadlineSchedules).toHaveLength(1);
+
+    // A full recovery then redelivers exactly once and cancels the deadline.
+    await stub.recoverSettlementIntentsForTest();
+    await waitForSettlementSchedule(stub, "rab-live");
+    await runDurableObjectAlarm(stub);
+    const results = await stub.getSettlementResults();
+    expect(results).toHaveLength(1);
+    expect(results[0].type).toBe("settled");
   });
 
   it("resolves AUTHENTICATING from auth_url when no live connection exists", async () => {
@@ -582,6 +901,152 @@ describe("durable MCP settlement watches", () => {
     const results = await stub.getSettlementResults();
     expect(results).toHaveLength(1);
     expect(results[0].type).toBe("settled");
+  });
+
+  it("keeps an armed deadline bridging an immediate settle so recovery can redeliver", async () => {
+    // P1: when the target already matches at registration, the terminal row is
+    // written synchronously and the delivery is scheduled across an await. If
+    // the DO is evicted in that gap there must STILL be an armed alarm (the
+    // deadline) so recovery is guaranteed a wake — otherwise the callback is
+    // stranded until an unrelated activation.
+    const stub = await settlementAgent("immediate-settle-bridge");
+    await stub.seedMcpServer(
+      "isb-server",
+      "https://mcp.example.com/isb",
+      MCPConnectionState.READY
+    );
+
+    // Register an already-matching watch but stop right after the terminal
+    // write (simulating eviction before the delivery schedule lands).
+    const { intentId, settled } =
+      await stub.armSettleWithoutDeliveryForTest("isb-server");
+    expect(settled).toBe(true);
+
+    // Terminal row, no delivery scheduled yet…
+    const rows = await stub.getSettlementIntentRows();
+    const row = rows.find((r) => r.id === intentId)!;
+    expect(row.status).toBe("settled");
+    expect(row.delivery_schedule_id).toBeNull();
+    // …but a deadline alarm is still armed — the bridge guaranteeing a wake.
+    expect(row.deadline_schedule_id).toBeTruthy();
+    const deadlineSchedules = (await stub.getSettlementScheduleRows()).filter(
+      (s) => s.callback === "_cf_checkMcpSettlementIntentDeadline"
+    );
+    expect(deadlineSchedules).toHaveLength(1);
+
+    // Recovery (what that alarm triggers on wake) redelivers exactly once and
+    // cancels the now-stale deadline.
+    await stub.recoverSettlementIntentsForTest();
+    await waitForSettlementSchedule(stub, intentId);
+    await runDurableObjectAlarm(stub);
+    await runDurableObjectAlarm(stub);
+
+    const results = await stub.getSettlementResults();
+    expect(results).toHaveLength(1);
+    expect(results[0].type).toBe("settled");
+  });
+
+  it("settles ready via post-reconnect re-derivation instead of timing out", async () => {
+    // P1: recovery runs while a restored connection is still CONNECTING (the
+    // background reconnect is not awaited). On a wake that only ran recovery,
+    // nothing keeps the DO alive for the reconnect, so the watch would fall
+    // through to its deadline. The bounded waitForConnections → re-derive that
+    // recovery anchors must settle the watch once the reconnect reaches READY.
+    const stub = await settlementAgent("post-reconnect-rederive");
+    await stub.seedMcpServer(
+      "prr-server",
+      "https://mcp.example.com/prr",
+      MCPConnectionState.CONNECTED
+    );
+    const watch = await stub.createSettlementWatchByServerId("prr-server");
+
+    // In-flight reconnect on wake: the connection sits CONNECTING.
+    await stub.evictConnectionsForTest();
+    await stub.recoverSettlementIntentsForTest();
+    const rows = await stub.getSettlementIntentRows();
+    expect(rows[0].status).toBe("live"); // not settled, not timed out
+
+    // Background reconnect completes to READY but emits NO in-memory event (the
+    // wake-only-for-recovery case). The post-reconnect re-derivation must
+    // settle it.
+    await stub.setConnectionStateForTest(
+      "prr-server",
+      MCPConnectionState.READY
+    );
+    await stub.rederiveDerivedDeliveriesForTest();
+
+    await waitForSettlementSchedule(stub, watch.intentId);
+    await runDurableObjectAlarm(stub);
+    const results = await stub.getSettlementResults();
+    expect(results).toHaveLength(1);
+    expect(results[0].type).toBe("settled");
+  });
+
+  it("settles a duplicate-URL watch against the server that reached a target state", async () => {
+    // P2: two servers share a URL. The second reaches ready while the first is
+    // still connecting — the watch must settle (against the ready one), not
+    // re-resolve to the first stored server and stay live.
+    const stub = await settlementAgent("dup-url-settle");
+    await stub.seedMcpServer(
+      "dus-a",
+      "https://mcp.example.com/dus",
+      MCPConnectionState.CONNECTING
+    );
+    await stub.seedMcpServer(
+      "dus-b",
+      "https://mcp.example.com/dus",
+      MCPConnectionState.CONNECTING
+    );
+
+    const watch = await stub.createSettlementWatchByUrl(
+      "https://mcp.example.com/dus"
+    );
+    const rows = await stub.getSettlementIntentRows();
+    expect(rows[0].status).toBe("live"); // neither ready yet
+
+    await stub.makeServerReadyThroughDiscovery("dus-b");
+    await waitForSettlementSchedule(stub, watch.intentId);
+    await runDurableObjectAlarm(stub);
+
+    const results = await stub.getSettlementResults();
+    expect(results).toHaveLength(1);
+    expect(results[0].type).toBe("settled");
+    if (results[0].type === "settled") {
+      expect(results[0].serverId).toBe("dus-b");
+    }
+  });
+
+  it("keeps a duplicate-URL watch live until the last matching server is removed", async () => {
+    // P2: removing ONE of several servers sharing a URL must not cancel a
+    // URL-targeted watch that another server still satisfies.
+    const stub = await settlementAgent("dup-url-cancel");
+    await stub.seedMcpServer(
+      "duc-a",
+      "https://mcp.example.com/duc",
+      MCPConnectionState.CONNECTING
+    );
+    await stub.seedMcpServer(
+      "duc-b",
+      "https://mcp.example.com/duc",
+      MCPConnectionState.CONNECTING
+    );
+    const watch = await stub.createSettlementWatchByUrl(
+      "https://mcp.example.com/duc"
+    );
+
+    // Remove one duplicate — another server still serves the URL → stay live.
+    await stub.removeMcpServerForSettlementTest("duc-a");
+    const rows = await stub.getSettlementIntentRows();
+    expect(rows.find((r) => r.id === watch.intentId)?.status).toBe("live");
+    expect(await stub.getSettlementResults()).toHaveLength(0);
+
+    // Remove the last matching server → now the watch cancels.
+    await stub.removeMcpServerForSettlementTest("duc-b");
+    await waitForSettlementSchedule(stub, watch.intentId);
+    await runDurableObjectAlarm(stub);
+    const results = await stub.getSettlementResults();
+    expect(results).toHaveLength(1);
+    expect(results[0].type).toBe("cancelled");
   });
 
   // At-least-once must not become more-than-once. After the awake path settles
@@ -788,7 +1253,7 @@ describe("durable MCP settlement watches", () => {
     // Retry with the SAME idempotencyKey (created: false) must arm the deadline.
     const result = await stub.createSettlementWatchByUrl(
       "https://mcp.example.com/retry",
-      { deadlineMs: 60_000, idempotencyKey: "retry-key" }
+      { deadlineSeconds: 60, idempotencyKey: "retry-key" }
     );
     expect(result.created).toBe(false);
     expect(result.intentId).toBe("retry-intent");
@@ -816,7 +1281,7 @@ describe("durable MCP settlement watches", () => {
 
     const watch = await stub.createSettlementWatchByUrl(
       "https://mcp.example.com/rederive-timeout",
-      { deadlineMs: 60_000 }
+      { deadlineSeconds: 60 }
     );
     let rows = await stub.getSettlementIntentRows();
     const armedDeadlineId = rows[0].deadline_schedule_id;
@@ -968,7 +1433,7 @@ describe("durable MCP settlement watches", () => {
       MCPConnectionState.CONNECTED
     );
     await stub.createSettlementWatchByServerId("watched", {
-      deadlineMs: 60_000
+      deadlineSeconds: 60
     });
 
     await stub.removeMcpServerForSettlementTest("watched");

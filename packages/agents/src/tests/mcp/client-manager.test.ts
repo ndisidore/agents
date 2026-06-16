@@ -2523,10 +2523,13 @@ describe("MCPClientManager OAuth Integration", () => {
         serverId: id,
         url: "http://example.com/mcp"
       });
-      // ...AND a terminal onServerStateChanged with the `"removed"` sentinel, so
-      // subscribers that only watch state changes still observe the deletion.
-      expect(onStateChangedSpy).toHaveBeenCalledTimes(1);
-      const change = onStateChangedSpy.mock.calls[0][0];
+      // ...AND a terminal onServerStateChanged with the `"removed"` sentinel as
+      // the FINAL state change, so subscribers that only watch state changes
+      // still observe the deletion. (Closing the live connection first fires a
+      // `null` downgrade for the still-registered server; removal then fires the
+      // terminal sentinel — both are level-triggered and the last wins.)
+      expect(onStateChangedSpy).toHaveBeenCalled();
+      const change = onStateChangedSpy.mock.calls.at(-1)![0];
       expect(change.serverId).toBe(id);
       expect(change.state).toBe("removed");
       expect(change.url).toBe("http://example.com/mcp");

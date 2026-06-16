@@ -13,6 +13,14 @@ import type {
 } from "./types";
 
 /**
+ * Upper bound on a watch's `deadlineSeconds`. A live intent row stays `live`
+ * for the whole deadline window (polluting live-intent queries on every state
+ * change and wake), so cap it at 30 days. Expressed in seconds to match the
+ * `deadlineSeconds` unit (30 * 24 * 60 * 60 = 2_592_000).
+ */
+const DEADLINE_MAX_SECONDS = 30 * 24 * 60 * 60; // 30 days
+
+/**
  * Minimal tagged-template SQL surface the store needs. An `Agent` satisfies
  * this structurally via its public `sql` method.
  */
@@ -99,6 +107,23 @@ export class McpSettlementStore {
       WHERE status = 'live' AND idempotency_key IS NOT NULL
     `;
 
+    // Partial index over live intents: every state-change match
+    // (`checkSettlementIntentsForServer`), live-deadline scan, and the bounded
+    // wake re-derive filters on `status = 'live'`. Keeps those off a full-table
+    // scan as terminal rows accumulate before their TTL prune.
+    this.agent.sql`
+      CREATE INDEX IF NOT EXISTS cf_agents_mcp_settlement_live
+      ON cf_agents_mcp_settlement_intents(status)
+      WHERE status = 'live'
+    `;
+
+    // serverId-targeted matching/retargeting looks intents up by server_id.
+    this.agent.sql`
+      CREATE INDEX IF NOT EXISTS cf_agents_mcp_settlement_server
+      ON cf_agents_mcp_settlement_intents(server_id)
+      WHERE server_id IS NOT NULL
+    `;
+
     this._tableReady = true;
   }
 
@@ -132,6 +157,15 @@ export class McpSettlementStore {
     if (!Array.isArray(parsed)) {
       throw new Error("Invalid MCP settlement target states");
     }
+    // Validate each value, not just the array shape — a corrupt stored row
+    // (e.g. a hand-edited or partially-written intent) must not smuggle an
+    // unknown state into matching. Mirrors `validateSettlementStates`.
+    const valid = new Set<string>(Object.values(MCPConnectionState));
+    for (const state of parsed) {
+      if (typeof state !== "string" || !valid.has(state)) {
+        throw new Error(`Invalid MCP connection state "${String(state)}"`);
+      }
+    }
     return parsed as MCPConnectionState[];
   }
 
@@ -163,13 +197,15 @@ export class McpSettlementStore {
       serverId: string | null;
       url: string | null;
       states: MCPConnectionState[];
-      deadlineMs?: number;
+      deadlineSeconds: number;
     }
   ): void {
-    const existingDeadlineMs =
+    const existingDeadlineSeconds =
       existing.deadline_at === null
         ? undefined
-        : Math.max(0, existing.deadline_at - existing.created_at);
+        : Math.round(
+            Math.max(0, existing.deadline_at - existing.created_at) / 1000
+          );
     const existingStates = this.parseTargetStates(existing.target_states);
     // States are an unordered set, so compare membership rather than position
     // ([ready, failed] and [failed, ready] are the same watch).
@@ -185,7 +221,7 @@ export class McpSettlementStore {
       existing.callback === requested.callback &&
       sameTarget &&
       sameStates &&
-      existingDeadlineMs === requested.deadlineMs
+      existingDeadlineSeconds === requested.deadlineSeconds
     ) {
       return;
     }
@@ -224,13 +260,33 @@ export class McpSettlementStore {
     );
   }
 
-  private listAllSettlementIntents(): MCPSettlementIntentRow[] {
+  /**
+   * Rows that wake re-derivation can act on: live intents (re-checked against
+   * current state / expired deadlines) plus terminal-but-unscheduled intents
+   * (a crash between settle and schedule, replayed from `result_json`).
+   * Deliberately excludes terminal rows already scheduled — they need no
+   * action and would otherwise be fetched on every wake while they wait out
+   * the 24h TTL prune (O(total_intents) per wake).
+   */
+  private listSettlementIntentsForRederive(): MCPSettlementIntentRow[] {
     return this.agent.sql<MCPSettlementIntentRow>`
       SELECT id, idempotency_key, server_id, url, callback, target_states,
         deadline_at, status, result_json, delivery_schedule_id,
         deadline_schedule_id, created_at, fired_at
       FROM cf_agents_mcp_settlement_intents
+      WHERE status = 'live'
+        OR (delivery_schedule_id IS NULL AND result_json IS NOT NULL)
     `;
+  }
+
+  /** Whether any intent is still live (has unresolved work). */
+  hasLiveSettlementIntents(): boolean {
+    return (
+      (this.agent.sql<{ n: number }>`
+        SELECT COUNT(*) AS n FROM cf_agents_mcp_settlement_intents
+        WHERE status = 'live'
+      `[0]?.n ?? 0) > 0
+    );
   }
 
   private listLiveSettlementIntents(): MCPSettlementIntentRow[] {
@@ -260,22 +316,34 @@ export class McpSettlementStore {
 
   // ── Server resolution + result construction ─────────────────────
 
-  private resolveServerForSettlement(
-    intent: Pick<MCPSettlementIntentRow, "server_id" | "url">
-  ): MCPServerRow | undefined {
+  /**
+   * All servers an intent currently targets. A serverId intent resolves to at
+   * most one; a URL intent can resolve to several when distinct servers share a
+   * URL. `preferred` (the server whose state changed) is moved to the front so
+   * a state-change pass evaluates the actual changed server first.
+   */
+  private resolveServersForSettlement(
+    intent: Pick<MCPSettlementIntentRow, "server_id" | "url">,
+    preferred?: MCPServerRow
+  ): MCPServerRow[] {
     const servers = this.servers.listServers();
 
     if (intent.server_id) {
-      return servers.find((server) => server.id === intent.server_id);
+      const match = servers.find((server) => server.id === intent.server_id);
+      return match ? [match] : [];
     }
 
     if (intent.url) {
-      return servers.find((server) =>
+      const matches = servers.filter((server) =>
         this.settlementUrlsMatch(server.server_url, intent.url!)
       );
+      if (preferred && matches.some((s) => s.id === preferred.id)) {
+        return [preferred, ...matches.filter((s) => s.id !== preferred.id)];
+      }
+      return matches;
     }
 
-    return undefined;
+    return [];
   }
 
   private getStateForSettlementServer(
@@ -355,23 +423,44 @@ export class McpSettlementStore {
   }
 
   private checkIntentAgainstCurrentState(
-    intent: MCPSettlementIntentRow
+    intent: MCPSettlementIntentRow,
+    preferredServer?: MCPServerRow
   ): MCPSettlementDelivery | undefined {
     if (intent.status !== "live") return undefined;
 
-    const server = this.resolveServerForSettlement(intent);
-    if (!server) return undefined;
-
-    const state = this.getStateForSettlementServer(server);
-    if (!state) return undefined;
+    // The deadline is authoritative: if it has already elapsed, settle as
+    // `timeout` even when the server now matches a target state — the requested
+    // deadline passed first. Checked before server resolution so an elapsed
+    // deadline still fires for a server that was never registered (the
+    // abandoned-OAuth / never-connected case), and so the awake fast-path and
+    // wake re-derivation agree regardless of alarm-flooring slack or runtime
+    // delay between `deadline_at` and the deadline alarm.
+    const now = Date.now();
+    if (intent.deadline_at !== null && intent.deadline_at <= now) {
+      return this.checkSettlementDeadline(intent.id, { now });
+    }
 
     const targetStates = this.parseTargetStates(intent.target_states);
-    if (!targetStates.includes(state)) return undefined;
 
-    return this.settleIntent(
+    // Settle against the FIRST targeted server currently in a target state, not
+    // merely the first server that shares the URL. With duplicate URLs the
+    // changed server (preferredServer) is evaluated first; if it isn't in a
+    // target state but another same-URL server is, we still settle against that
+    // one — and if none match yet, the watch stays live.
+    for (const server of this.resolveServersForSettlement(
       intent,
-      this.buildSettlementResult(intent, server, state)
-    );
+      preferredServer
+    )) {
+      const state = this.getStateForSettlementServer(server);
+      if (state && targetStates.includes(state)) {
+        return this.settleIntent(
+          intent,
+          this.buildSettlementResult(intent, server, state)
+        );
+      }
+    }
+
+    return undefined;
   }
 
   // ── Public API ──────────────────────────────────────────────────
@@ -392,8 +481,20 @@ export class McpSettlementStore {
       throw new Error("watchMcpServerSettled requires a callback");
     }
 
-    if (options.deadlineMs !== undefined && options.deadlineMs <= 0) {
-      throw new Error("watchMcpServerSettled deadlineMs must be positive");
+    if (
+      typeof options.deadlineSeconds !== "number" ||
+      !Number.isFinite(options.deadlineSeconds) ||
+      options.deadlineSeconds <= 0
+    ) {
+      throw new Error(
+        "watchMcpServerSettled deadlineSeconds must be a positive number"
+      );
+    }
+
+    if (options.deadlineSeconds > DEADLINE_MAX_SECONDS) {
+      throw new Error(
+        `watchMcpServerSettled deadlineSeconds must not exceed ${DEADLINE_MAX_SECONDS} (30 days)`
+      );
     }
 
     const states = this.validateSettlementStates(
@@ -411,7 +512,7 @@ export class McpSettlementStore {
       if (existing) {
         this.assertCompatibleSettlementIntent(existing, {
           callback: options.callback,
-          deadlineMs: options.deadlineMs,
+          deadlineSeconds: options.deadlineSeconds,
           serverId: targetServerId,
           states,
           url: targetUrl
@@ -429,7 +530,7 @@ export class McpSettlementStore {
     const intent: MCPSettlementIntentRow = {
       callback: options.callback,
       created_at: now,
-      deadline_at: options.deadlineMs ? now + options.deadlineMs : null,
+      deadline_at: now + options.deadlineSeconds * 1000,
       deadline_schedule_id: null,
       delivery_schedule_id: null,
       fired_at: null,
@@ -442,14 +543,32 @@ export class McpSettlementStore {
       url: targetUrl
     };
 
+    // Insert the live row only — do NOT settle here. The mixin arms the
+    // deadline alarm first, then calls checkSettlementNow(): that ordering
+    // guarantees an armed alarm bridges the (synchronous) terminal write and
+    // the (awaited) delivery schedule, so an eviction in that gap still has an
+    // alarm to wake recovery. Settling inline here would write the terminal row
+    // before any alarm exists (the P1 lost-callback window for already-matching
+    // servers).
     this.insertSettlementIntent(intent);
-    const delivery = this.checkIntentAgainstCurrentState(intent);
 
     return {
       created: true,
-      deliveries: delivery ? [delivery] : [],
+      deliveries: [],
       intentId: intent.id
     };
+  }
+
+  /**
+   * Settle an intent now if its target already matches current state, returning
+   * the delivery to schedule (or `undefined`). Called by the mixin AFTER the
+   * deadline alarm is armed, so the terminal write is always covered by an armed
+   * alarm. Safe to call on an already-terminal intent (returns `undefined`).
+   */
+  checkSettlementNow(intentId: string): MCPSettlementDelivery | undefined {
+    const intent = this.getSettlementIntent(intentId);
+    if (!intent) return undefined;
+    return this.checkIntentAgainstCurrentState(intent);
   }
 
   markSettlementDeliveryScheduled(intentId: string, scheduleId: string): void {
@@ -494,18 +613,26 @@ export class McpSettlementStore {
   }
 
   /**
-   * Cancel all live intents targeting a server that is being removed. Accepts
-   * the last-known `url` (from the core `onServerRemoved` event) so URL-targeted
-   * intents still match even though the storage row is about to disappear.
+   * Cancel live intents targeting a server that is being removed. Accepts the
+   * last-known `url` (from the core `onServerRemoved` event) so URL-targeted
+   * intents still match even though the storage row is already gone.
+   *
+   * `onServerRemoved` fires AFTER the storage row is deleted, so
+   * `listServers()` no longer includes the removed server. A URL-targeted watch
+   * is therefore only cancelled when NO remaining server still shares that URL
+   * — removing one of several duplicate-URL servers must not strand a watch
+   * that another server still satisfies. serverId-targeted watches always
+   * cancel (their specific server is gone).
    */
   cancelSettlementIntentsForServer(
     serverId: string,
     options?: { reason?: string; url?: string }
   ): MCPSettlementDelivery[] {
     const deliveries: MCPSettlementDelivery[] = [];
+    const remainingServers = this.servers.listServers();
     const serverUrl =
       options?.url ??
-      this.servers.listServers().find((s) => s.id === serverId)?.server_url;
+      remainingServers.find((s) => s.id === serverId)?.server_url;
 
     for (const intent of this.listLiveSettlementIntents()) {
       try {
@@ -515,6 +642,16 @@ export class McpSettlementStore {
             ? this.settlementUrlsMatch(intent.url, serverUrl)
             : false;
         if (!matchesServerId && !matchesUrl) continue;
+
+        // A URL-only match is moot if another server still serves that URL.
+        if (!matchesServerId && matchesUrl && intent.url) {
+          const anotherServerMatches = remainingServers.some(
+            (s) =>
+              s.id !== serverId &&
+              this.settlementUrlsMatch(s.server_url, intent.url!)
+          );
+          if (anotherServerMatches) continue;
+        }
 
         const delivery = this.cancelSettlementIntent(
           intent.id,
@@ -563,7 +700,10 @@ export class McpSettlementStore {
           : false;
         if (!matchesServerId && !matchesUrl) continue;
 
-        const delivery = this.checkIntentAgainstCurrentState(intent);
+        // Evaluate against the server that actually changed first — so a URL
+        // watch settles on the duplicate that reached a target state, not
+        // whichever same-URL server happens to be stored first.
+        const delivery = this.checkIntentAgainstCurrentState(intent, server);
         if (delivery) deliveries.push(delivery);
       } catch (error) {
         console.error(
@@ -603,7 +743,9 @@ export class McpSettlementStore {
 
     const states = this.parseTargetStates(intent.target_states);
     const result: MCPServerSettledResult = {
-      deadlineMs: Math.max(0, intent.deadline_at - intent.created_at),
+      deadlineSeconds: Math.round(
+        Math.max(0, intent.deadline_at - intent.created_at) / 1000
+      ),
       intentId,
       serverId: intent.server_id ?? undefined,
       targetStates: states,
@@ -626,14 +768,15 @@ export class McpSettlementStore {
   rederiveSettlementIntents(): MCPSettlementDelivery[] {
     const deliveries: MCPSettlementDelivery[] = [];
 
-    for (const intent of this.listAllSettlementIntents()) {
+    for (const intent of this.listSettlementIntentsForRederive()) {
       // Per-row isolation: this loop IS the hibernation backstop, so one
       // corrupt/unexpected row must never abort recovery of the rest.
       try {
         if (intent.status === "live") {
-          const delivery =
-            this.checkIntentAgainstCurrentState(intent) ??
-            this.checkSettlementDeadline(intent.id);
+          // `checkIntentAgainstCurrentState` already settles an elapsed
+          // deadline (it checks `deadline_at <= now` before server matching),
+          // so no separate `checkSettlementDeadline` fallback is needed.
+          const delivery = this.checkIntentAgainstCurrentState(intent);
           if (delivery) deliveries.push(delivery);
           continue;
         }

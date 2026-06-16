@@ -4,11 +4,15 @@ Durable, hibernation-safe "tell me when this MCP server is ready" callbacks for 
 
 > ⚠️ **Experimental** — this API may break between releases. Pin your `agents` version.
 
+## The use case this is built for
+
+**The DO that owns an MCP connection's auth is usually not the DO that consumes it, and they hibernate independently.** A user's `IdentityDO` holds the authenticated connection; many `WorkspaceDO`s depend on it being ready. The consumer can be asleep when the connection settles, and the owner can be asleep when the consumer wakes and asks "is it ready yet?" — so **neither side can hold an in-memory promise or listener that bridges the gap**. Everything below follows from that constraint. If you only need to gate work inside a single owner DO, that's the degenerate case (no consumers) and works too — but the cross-DO, independently-hibernating split is the motivating scenario. See [Intended architecture & use case](#intended-architecture--use-case).
+
 ## Why
 
 The MCP connection lifecycle lives in `this.mcp` (the `MCPClientManager`), but it isn't wired into any durable primitive. Readiness is only observable via in-memory mechanisms (`onServerStateChanged`, `waitForConnections()`) that don't survive hibernation — so apps hand-roll backoff polls and alarm backstops. `withMcpSettlement` expresses MCP readiness as a first-class **durable continuation**: it records the watch durably and fires your callback through `this.schedule()`, re-deriving outstanding watches on wake. No in-memory listener to lose.
 
-It fires **watched or not, hibernated or not**, with no fleet-wide idle wakes (the alarm exists only while a watch is outstanding) — so a consuming app can delete its frontend readiness poll, its in-memory follow-up retry loop, and its DO-alarm backstop. The capability a pollable snapshot can't provide is the **`deadlineMs` → timeout**: if a server never reaches a target state (e.g. the user abandons OAuth), nothing inbound wakes the owner, and only a durable alarm can resolve it. That's why the watch is the primitive and [the persisted snapshot](#cross-do-fan-out-app-level) is its complement, not a substitute.
+It fires **watched or not, hibernated or not**, with no fleet-wide idle wakes (the alarm exists only while a watch is outstanding) — so a consuming app can delete its frontend readiness poll, its in-memory follow-up retry loop, and its DO-alarm backstop. The capability a pollable snapshot can't provide is the **`deadlineSeconds` → timeout**: if a server never reaches a target state (e.g. the user abandons OAuth), nothing inbound wakes the owner, and only a durable alarm can resolve it. That's why the watch is the primitive and [the persisted snapshot](#cross-do-fan-out-app-level) is its complement, not a substitute.
 
 The callback fires in the DO that owns the connection. Delivering that signal to _other_ DOs (e.g. sibling `WorkspaceDO`s sharing one `IdentityDO`'s connection) is app routing — see [Cross-DO fan-out](#cross-do-fan-out-app-level), which the SDK is designed to support but does not perform.
 
@@ -66,7 +70,7 @@ export class MyAgent extends withMcpSettlement(Agent<Env>) {
     // or 30s elapses (timeout). Survives hibernation.
     await this.watchMcpServerSettled(
       { serverId: id },
-      { callback: "onServerSettled", deadlineMs: 30_000 }
+      { callback: "onServerSettled", deadlineSeconds: 30 }
     );
   }
 
@@ -78,7 +82,7 @@ export class MyAgent extends withMcpSettlement(Agent<Env>) {
         console.log(`${result.serverName} → ${result.state}`, result.error);
         break;
       case "timeout":
-        console.log(`timed out after ${result.deadlineMs}ms`);
+        console.log(`timed out after ${result.deadlineSeconds}s`);
         break;
       case "cancelled":
         console.log(`cancelled: ${result.reason}`);
@@ -101,7 +105,7 @@ Registers a durable, **one-shot** watch. Returns `{ intentId, created }` (`creat
 - `target` — exactly one of `{ serverId }` or `{ url }`.
 - `opts.callback` — name of a method on your agent (`keyof this`).
 - `opts.states` — states that settle the watch. Default `["ready", "failed"]`.
-- `opts.deadlineMs` — optional; fires a `timeout` result if no state matches in time. **Deadlines are approximate**: the alarm scheduler floors fire times to whole seconds and the watch adds ~1s of slack so a timeout is never lost to flooring, so a `timeout` may fire up to ~1s after `deadlineMs`. Don't use it where sub-second precision matters.
+- `opts.deadlineSeconds` — **required**; fires a `timeout` result if no watched state is reached in time. Required by design: every watch arms a durable deadline alarm, so (a) the abandoned-OAuth case — where nothing inbound ever wakes the owner — always resolves, and (b) every intent has a self-cleaning terminal path, so a live watch row can never leak. The deadline is **authoritative**: if it elapses before a watched state is reached, the watch settles as `timeout`, not a late `settled`. **Deadlines are approximate**: the alarm scheduler floors fire times to whole seconds and the watch adds ~1s of slack so a timeout is never lost to flooring, so a `timeout` may fire up to ~1s after `deadlineSeconds`. Don't use it where sub-second precision matters. The unit aligns with `this.schedule()`, whose native unit is also seconds; multi-day deadlines are fine (a single durable alarm, no idle wakes).
 - `opts.idempotencyKey` — optional; dedupes concurrent registrations.
 
 It fires **once** — it's a durable latch/gate, not an ongoing subscription. To track a server's state **over time** (e.g. a banner: ready → needs-reauth → ready), don't re-arm watches in a loop (you'd miss transitions in the gap between firing and re-arming); read the durable snapshot instead — see [Cross-DO fan-out](#cross-do-fan-out-app-level).
@@ -115,7 +119,7 @@ Cancels a live watch and delivers a `cancelled` result. Resolves `true` if one w
 Discriminated union on `type`:
 
 - `"settled"` — `serverId`, `serverName`, `url`, `state`, `error?`
-- `"timeout"` — `targetStates`, `deadlineMs`
+- `"timeout"` — `targetStates`, `deadlineSeconds`
 - `"cancelled"` — `reason?`
 
 > **Terminology:** the _watch_ "settles" on **any** of these terminal outcomes. The `type: "settled"` variant specifically means the server **reached one of the watched states** — a `timeout` or `cancelled` is also a way the watch settles, just with a different `type`. Always `switch` on `result.type`; don't assume "settled" covers timeouts.
@@ -163,4 +167,4 @@ class ConsumerAgent extends Agent<Env> {
 }
 ```
 
-The snapshot is **level-triggered**: the live event and the durable snapshot both describe the latest `{ state }`, applied idempotently — there is no ordering cursor to track, and a late-arriving older push is self-correcting on the next push/poll. `state` includes `"authenticating"` (derived from a pending OAuth `auth_url`), so the banner's re-auth signal is pollable. The SDK never pushes to consumers or tracks a subscriber registry — multi-DO routing stays your code.
+The snapshot is **level-triggered**: the live event and the durable snapshot both describe the latest `{ state }`, applied idempotently — there is no ordering cursor to track, and a late-arriving older push is self-correcting on the next push/poll. `state` includes `"authenticating"` (derived from a pending OAuth `auth_url`), so the banner's re-auth signal is pollable. Closing a connection without removing the server (`closeConnection` / `closeAllConnections`) refreshes the snapshot too, so a poll-on-wake consumer sees the server drop out of `ready` rather than reading a stale value. The SDK never pushes to consumers or tracks a subscriber registry — multi-DO routing stays your code.

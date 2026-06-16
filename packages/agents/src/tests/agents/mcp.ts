@@ -19,7 +19,9 @@ import {
   MCPConnectionState
 } from "../../mcp/client-connection.ts";
 import type { MCPServerStateChange } from "../../mcp/client.ts";
+import { RPC_DO_PREFIX } from "../../mcp/rpc.ts";
 import { withMcpSettlement } from "../../experimental/mcp-settlement/index.ts";
+import type { McpSettlementStore } from "../../experimental/mcp-settlement/store.ts";
 import type {
   MCPServerSettledResult,
   MCPServerSettlementTarget
@@ -1081,7 +1083,7 @@ export class TestConnectionUriAgent extends Agent {
 
 type SettlementWatchOptions = {
   states?: MCPConnectionState[];
-  deadlineMs?: number;
+  deadlineSeconds?: number;
   idempotencyKey?: string;
   callbackName?: "onMcpSettlement" | "onOtherMcpSettlement";
 };
@@ -1141,10 +1143,33 @@ export class TestMcpSettlementAgent extends withMcpSettlement(Agent) {
   ): Promise<{ intentId: string; created: boolean }> {
     return this.watchMcpServerSettled(target, {
       callback: options?.callbackName ?? "onMcpSettlement",
-      deadlineMs: options?.deadlineMs,
+      // Deadline is required by the API; default to 60s for tests that don't
+      // exercise deadline/timeout behavior. Tests that do pass it explicitly.
+      deadlineSeconds: options?.deadlineSeconds ?? 60,
       idempotencyKey: options?.idempotencyKey,
       states: options?.states
     });
+  }
+
+  // Bypass the harness default to prove the public API rejects a watch with no
+  // deadline (deadlineSeconds is required).
+  @callable()
+  async createSettlementWatchWithoutDeadlineForTest(
+    serverId: string
+  ): Promise<string> {
+    try {
+      await this.watchMcpServerSettled(
+        { serverId },
+        // Intentionally omit the required deadlineSeconds.
+        { callback: "onMcpSettlement" } as unknown as {
+          callback: "onMcpSettlement";
+          deadlineSeconds: number;
+        }
+      );
+      return "no-error";
+    } catch (error) {
+      return error instanceof Error ? error.message : String(error);
+    }
   }
 
   // Intentionally does NOT call super.onStart(): proves wake re-derivation
@@ -1255,6 +1280,57 @@ export class TestMcpSettlementAgent extends withMcpSettlement(Agent) {
     await this.removeMcpServer(serverId);
   }
 
+  // Close a connection without removing the server (the connection is
+  // disconnected but its config row stays). Used to prove the durable snapshot
+  // is refreshed on close rather than left reading a stale `ready`.
+  @callable()
+  async closeMcpConnectionForTest(serverId: string): Promise<void> {
+    await this.mcp.closeConnection(serverId);
+  }
+
+  // Force `connection.close()` to reject, then close — proving the snapshot is
+  // still downgraded (in the `finally`) even when close throws.
+  @callable()
+  async closeMcpConnectionExpectingThrowForTest(
+    serverId: string
+  ): Promise<{ threw: boolean }> {
+    const conn = this.mcp.mcpConnections[serverId];
+    if (conn) {
+      conn.close = async () => {
+        throw new Error("simulated close failure");
+      };
+    }
+    try {
+      await this.mcp.closeConnection(serverId);
+      return { threw: false };
+    } catch {
+      return { threw: true };
+    }
+  }
+
+  // Run the recovery ordering — re-arm live deadlines FIRST, then re-derive
+  // (which settles a matching intent) — but deliberately DO NOT schedule the
+  // resulting delivery, simulating an eviction in the settle → delivery gap.
+  // The invariant under test (the P1 fix): the now-terminal intent still has an
+  // armed deadline alarm to bridge that gap (with the old order it would have
+  // settled before any deadline was armed, leaving no alarm).
+  @callable()
+  async recoverArmThenRederiveWithoutDeliveryForTest(): Promise<void> {
+    const settlement = (this as unknown as { _settlement: McpSettlementStore })
+      ._settlement;
+    for (const deadline of settlement.listLiveSettlementDeadlines()) {
+      await (
+        this as unknown as {
+          _scheduleMcpSettlementDeadline(d: {
+            intentId: string;
+            deadlineAt: number;
+          }): Promise<void>;
+        }
+      )._scheduleMcpSettlementDeadline(deadline);
+    }
+    settlement.rederiveSettlementIntents();
+  }
+
   @callable()
   async makeServerReadyThroughDiscovery(serverId: string): Promise<void> {
     const conn = this.mcp.mcpConnections[serverId];
@@ -1265,6 +1341,67 @@ export class TestMcpSettlementAgent extends withMcpSettlement(Agent) {
       return { success: true };
     };
     await this.mcp.discoverIfConnected(serverId);
+  }
+
+  // Set a connection's state directly WITHOUT firing onServerStateChanged, so a
+  // test can isolate the wake re-derivation path (the P1 post-reconnect re-derive)
+  // from the awake event fast-path. Mirrors a background reconnect that reached
+  // READY on a wake where nothing kept the DO alive to emit the in-memory event.
+  @callable()
+  async setConnectionStateForTest(
+    serverId: string,
+    state: MCPConnectionState
+  ): Promise<void> {
+    const conn = this.mcp.mcpConnections[serverId];
+    if (!conn) throw new Error(`Missing connection ${serverId}`);
+    conn.connectionState = state;
+  }
+
+  // Invoke the mixin's post-reconnect re-derivation directly — this is what the
+  // recovery `ctx.waitUntil(waitForConnections().then(...))` runs once the
+  // background reconnects settle. Re-derives from durable state and schedules
+  // any resulting deliveries.
+  @callable()
+  async rederiveDerivedDeliveriesForTest(): Promise<void> {
+    await (
+      this as unknown as {
+        _scheduleDerivedMcpSettlementDeliveries(): Promise<void>;
+      }
+    )._scheduleDerivedMcpSettlementDeliveries();
+  }
+
+  // Reproduce the P1 immediate-settle crash window: register a watch whose
+  // target already matches, arm the deadline, record the terminal decision —
+  // then STOP, simulating an eviction before the delivery schedule lands. The
+  // invariant under test is that an armed deadline alarm bridges this gap, so
+  // recovery can still redeliver. Returns the intentId and whether it settled.
+  @callable()
+  async armSettleWithoutDeliveryForTest(
+    serverId: string,
+    deadlineSeconds = 60
+  ): Promise<{ intentId: string; settled: boolean }> {
+    const settlement = (this as unknown as { _settlement: McpSettlementStore })
+      ._settlement;
+    const registration = settlement.registerSettlementIntent(
+      { serverId },
+      { callback: "onMcpSettlement", deadlineSeconds }
+    );
+    // Created path inserts a live row only (no inline settle). Arm the deadline
+    // FIRST (the bridging alarm)…
+    const pending = settlement.getPendingDeadline(registration.intentId);
+    if (pending) {
+      await (
+        this as unknown as {
+          _scheduleMcpSettlementDeadline(d: {
+            intentId: string;
+            deadlineAt: number;
+          }): Promise<void>;
+        }
+      )._scheduleMcpSettlementDeadline(pending);
+    }
+    // …then record the terminal decision, but DO NOT schedule the delivery.
+    const delivery = settlement.checkSettlementNow(registration.intentId);
+    return { intentId: registration.intentId, settled: !!delivery };
   }
 
   // Simulate a wake by re-running the framework onStart wrapper, which invokes
@@ -1311,6 +1448,40 @@ export class TestMcpSettlementAgent extends withMcpSettlement(Agent) {
       ON CONFLICT(server_id) DO UPDATE SET
         state = excluded.state, updated_at = excluded.updated_at
     `;
+  }
+
+  // Insert an RPC (`rpc:`) server config row directly, so a subsequent
+  // `_restoreRpcMcpServers` tries to restore it. `bindingName` controls whether
+  // the env binding resolves: pass a name absent from `env` to simulate a
+  // deploy that renamed/removed the binding. Pass `corruptOptions: true` to
+  // store unparseable `server_options` (the JSON.parse-throws case).
+  @callable()
+  async seedRpcServerRowForTest(
+    id: string,
+    normalizedName: string,
+    bindingName: string,
+    opts?: { corruptOptions?: boolean }
+  ): Promise<void> {
+    const serverOptions = opts?.corruptOptions
+      ? "{not valid json"
+      : JSON.stringify({ bindingName });
+    this.sql`
+      INSERT OR REPLACE INTO cf_agents_mcp_servers (
+        id, name, server_url, client_id, auth_url, callback_url, server_options
+      ) VALUES (
+        ${id}, ${id}, ${`${RPC_DO_PREFIX}${normalizedName}`}, NULL, NULL,
+        ${""}, ${serverOptions}
+      )
+    `;
+  }
+
+  // Drive the core RPC restore path (the one the Agent runs on wake after
+  // HTTP/OAuth restore). Exposed so tests can assert the failed-restore
+  // snapshot downgrade + per-row isolation.
+  @callable()
+  async restoreRpcServersForTest(): Promise<void> {
+    // @ts-expect-error - accessing private method for testing
+    await this._restoreRpcMcpServers();
   }
 
   // Re-run the framework onStart wrapper with the restore latch reset, so
@@ -1563,6 +1734,30 @@ export class TestMcpSettlementAgent extends withMcpSettlement(Agent) {
         deadline_schedule_id, created_at, fired_at
       ) VALUES (
         ${intentId}, NULL, NULL, ${url}, ${"onMcpSettlement"},
+        ${JSON.stringify([MCPConnectionState.READY])}, ${now + deadlineMs},
+        ${"live"}, NULL, NULL, NULL, ${now}, NULL
+      )
+    `;
+  }
+
+  // The crash window for a serverId-targeted watch: a live intent with a
+  // deadline but no deadline_schedule_id (crash between the intent INSERT and
+  // the deadline schedule INSERT). Used to prove recovery arms the deadline
+  // BEFORE settling a server that already matches.
+  @callable()
+  async insertLiveServerDeadlineIntentWithoutScheduleForTest(
+    intentId: string,
+    serverId: string,
+    deadlineMs: number
+  ): Promise<void> {
+    const now = Date.now();
+    this.sql`
+      INSERT INTO cf_agents_mcp_settlement_intents (
+        id, idempotency_key, server_id, url, callback, target_states,
+        deadline_at, status, result_json, delivery_schedule_id,
+        deadline_schedule_id, created_at, fired_at
+      ) VALUES (
+        ${intentId}, NULL, ${serverId}, NULL, ${"onMcpSettlement"},
         ${JSON.stringify([MCPConnectionState.READY])}, ${now + deadlineMs},
         ${"live"}, NULL, NULL, NULL, ${now}, NULL
       )

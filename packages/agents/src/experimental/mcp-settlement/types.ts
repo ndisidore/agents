@@ -31,7 +31,8 @@ export type MCPServerSettledResult =
       serverId?: string;
       url?: string;
       targetStates: MCPConnectionState[];
-      deadlineMs: number;
+      /** The watch's deadline, in seconds (as requested via `deadlineSeconds`). */
+      deadlineSeconds: number;
     }
   | {
       type: "cancelled";
@@ -71,6 +72,13 @@ export type MCPSettlementIntentRow = {
   url: string | null;
   callback: string;
   target_states: string;
+  /**
+   * Absolute deadline as epoch **milliseconds** (internal unit, consistent with
+   * `created_at`/`fired_at` and `Date.now()`). The public API expresses this as
+   * `deadlineSeconds`; conversion happens only at the store boundary. Always
+   * set for intents created by the current API (a deadline is required);
+   * nullable only to stay defensive against legacy/corrupt rows.
+   */
   deadline_at: number | null;
   status: MCPSettlementIntentStatus;
   result_json: string | null;
@@ -83,7 +91,8 @@ export type MCPSettlementIntentRow = {
 export type RegisterMCPSettlementIntentOptions = {
   callback: string;
   states?: MCPConnectionState[];
-  deadlineMs?: number;
+  /** Required: the watch always arms a durable deadline (see store boundary). */
+  deadlineSeconds: number;
   idempotencyKey?: string;
 };
 

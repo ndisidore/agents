@@ -25,7 +25,7 @@ const agent = new Settling(
 // watchMcpServerSettled returns the durable registration handle.
 agent.watchMcpServerSettled(
   { serverId: "s1" },
-  { callback: "onReady" }
+  { callback: "onReady", deadlineSeconds: 30 }
 ) satisfies Promise<{ intentId: string; created: boolean }>;
 
 // URL targeting and the full options bag type-check.
@@ -33,7 +33,7 @@ agent.watchMcpServerSettled(
   { url: "https://example.com/mcp" },
   {
     callback: "onReady",
-    deadlineMs: 30_000,
+    deadlineSeconds: 30,
     idempotencyKey: "k",
     states: [MCPConnectionState.READY, MCPConnectionState.FAILED]
   }
@@ -51,13 +51,16 @@ agent._cf_checkMcpSettlementIntentDeadline({
 // @ts-expect-error - callback must name a member of the agent (keyof this).
 agent.watchMcpServerSettled({ serverId: "s1" }, { callback: "missingMethod" });
 
+// @ts-expect-error - deadlineSeconds is required.
+agent.watchMcpServerSettled({ serverId: "s1" }, { callback: "onReady" });
+
 // Target must be exactly one of serverId | url, not both. The directive sits
 // directly above the offending argument line so it survives formatter wrapping.
 const bothTarget = { serverId: "s1", url: "https://e.com/mcp" };
 agent.watchMcpServerSettled(
   // @ts-expect-error - serverId and url are mutually exclusive.
   bothTarget,
-  { callback: "onReady" }
+  { callback: "onReady", deadlineSeconds: 30 }
 );
 
 // @ts-expect-error - callback is required.

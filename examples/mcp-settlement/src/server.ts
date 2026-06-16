@@ -3,33 +3,45 @@
  *
  * Topology: one Durable Object *owns* an MCP connection; other DOs *consume*
  * its readiness. This is the IdentityDO / WorkspaceDO shape the
- * `withMcpSettlement` mixin is designed for. It demonstrates the three distinct
- * signals that together cover awake and hibernating consumers without ever
- * force-waking a hibernating one:
+ * `withMcpSettlement` mixin is designed for — and the reason the feature exists:
+ * the owner and each consumer hibernate **independently**, so a consumer can be
+ * asleep when the connection settles, and the owner can be asleep when the
+ * consumer wakes and asks "is it ready yet?". Neither side can hold an in-memory
+ * promise or listener that spans that gap.
  *
- *   1. Owner durable gate    — `watchMcpServerSettled` fires `onServerSettled`
- *      once the server is ready/failed, surviving the OWNER's hibernation.
- *   2. Awake fast-path       — the owner relays `onServerStateChanged` (an
- *      in-memory event, immediate) to subscribed, awake consumers.
- *   3. Poll-on-wake          — a hibernating consumer reconciles on ITS OWN
- *      wake by reading the owner's durable `{ state }` snapshot.
+ * How a workspace learns of readiness/settlement:
  *
- * The SDK never pushes to or tracks consumers — the subscriber registry and the
- * relay below are ordinary app code.
+ *   1. Owner durable gate — `watchMcpServerSettled` fires `onServerSettled` once
+ *      the server is ready/failed (or `deadlineSeconds` elapses), surviving the
+ *      OWNER's hibernation. The deadline → `timeout` is the part a snapshot
+ *      can't cover (abandoned OAuth: nothing inbound ever wakes the owner).
+ *   2. Awake fast-path — the workspace opens a WebSocket TO the owner while it
+ *      is awake; the owner `broadcast`s status changes over its open sockets. A
+ *      hibernating workspace has no socket, so it is skipped — never
+ *      force-woken. Only the workspace ever initiates contact (it may wake the
+ *      owner; the owner never wakes a workspace).
+ *   3. Poll-on-wake — on its own wake (and when it opens the socket) the
+ *      workspace reconciles by reading the owner's durable published status.
  */
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import {
   Agent,
   type AgentContext,
+  type Connection,
   callable,
   getAgentByName,
   routeAgentRequest
 } from "agents";
 import { McpAgent } from "agents/mcp";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { withMcpSettlement } from "agents/experimental/mcp-settlement";
 import type { MCPServerSettledResult } from "agents/experimental/mcp-settlement";
-import type { MCPServerStateSnapshot } from "agents/mcp/client";
 import { z } from "zod";
+import {
+  DEMO_SERVER_ID,
+  type Banner,
+  type OwnerStatus,
+  type OwnerStatusPush
+} from "./shared";
 
 /** A trivial bundled MCP server so the example is fully self-contained. */
 export class DemoMcpServer extends McpAgent<Env, { calls: number }, {}> {
@@ -48,52 +60,24 @@ export class DemoMcpServer extends McpAgent<Env, { calls: number }, {}> {
   }
 }
 
-/** What a consumer renders — e.g. an auth/connection-status banner. */
-type Banner = {
-  serverId: string;
-  state: string | null;
-  /** Last-known connection error, if any (carried on the shared snapshot). */
-  error?: string;
-  /** Where the consumer last learned this from. */
-  via: "poll-on-wake" | "live-push" | "none";
-  /**
-   * The terminal settlement outcome, once the watch resolves. Distinct from
-   * `state`: a `timeout` (abandoned OAuth) fires with no inbound transition, so
-   * the connection snapshot still reads `authenticating` — only the settlement
-   * result can tell the consumer the watch gave up.
-   */
-  settlement: MCPServerSettledResult["type"] | null;
-};
-
-const DEMO_SERVER_ID = "demo";
-
 /**
- * The connection owner. Holds the MCP connection and a durable settlement
- * watch, and relays readiness to its registered consumers.
+ * The connection owner. Holds the MCP connection + a durable settlement watch,
+ * publishes its status as Agent state, and pushes status changes to the
+ * workspaces that have opened a socket to it. It never reaches into a workspace.
  */
-export class IdentityDO extends withMcpSettlement(Agent<Env>) {
-  // App-owned consumer registry (the SDK does not track consumers).
-  //
-  // INTENTIONALLY EPHEMERAL: this in-memory set is lost when THIS owner DO
-  // hibernates, so the live-push fast-path (`fanout`) silently reaches no one
-  // after a sleep — by design. Durability lives entirely in the snapshot +
-  // poll-on-wake path (`WorkspaceDO.onStart` re-`subscribe`s and re-reads the
-  // owner's `{ state }`). A production app that needs the push path to
-  // survive the owner's hibernation would persist this registry (e.g. in
-  // `ctx.storage`) and rehydrate it in `onStart`.
-  private subscribers = new Set<string>();
+export class IdentityDO extends withMcpSettlement(Agent<Env, OwnerStatus>) {
+  initialState: OwnerStatus = {
+    authRequired: false,
+    settlement: null,
+    state: null
+  };
 
   constructor(ctx: AgentContext, env: Env) {
     super(ctx, env);
-
-    // Awake fast-path: relay live state changes to awake consumers
-    // immediately (in-memory event, no alarm latency). Hibernating consumers
-    // ignore the push and reconcile from the snapshot on their own wake.
-    this.mcp.onServerStateChanged((change) => {
-      void this.fanout(change.serverId).catch((error) => {
-        console.error("[mcp-settlement-example] fanout failed:", error);
-      });
-    });
+    // Recompute + publish whenever the owned connection's state changes
+    // (connect/discover/ready/fail, and the close on disconnect). This is the
+    // owner-local SDK event; getting it to a workspace is the broadcast below.
+    this.mcp.onServerStateChanged(() => this.publish());
   }
 
   /** Connect to the bundled MCP server and arm a durable readiness watch. */
@@ -105,40 +89,25 @@ export class IdentityDO extends withMcpSettlement(Agent<Env>) {
       { id: DEMO_SERVER_ID }
     );
 
-    // One durable watch per server. It fires once when the server settles —
-    // even if THIS owner hibernates before the server becomes ready. The
-    // deadlineMs is the part a pollable snapshot can't cover: if the server
-    // never reaches ready (e.g. the user abandons OAuth), nothing inbound wakes
-    // the owner, so the durable alarm fires a `timeout` to resolve the banner
-    // with no watcher.
-    //
-    // `idempotencyKey` keeps this to ONE live watch per server: re-running
-    // /connect (a double click, a refresh, a reconnect) dedupes against the
-    // existing live intent instead of arming a second deadline and delivering
-    // `onServerSettled` twice — the foot-gun the key exists to prevent.
+    // One durable watch per server (idempotencyKey dedupes re-runs). Fires once
+    // the server settles, surviving the owner's hibernation.
     const { intentId } = await this.watchMcpServerSettled(
       { serverId: id },
       {
         callback: "onServerSettled",
-        deadlineMs: 30_000,
+        deadlineSeconds: 30,
         idempotencyKey: `settle:${id}`
       }
     );
+    this.publish({ authRequired: false, settlement: null });
     return { intentId };
   }
 
   /**
-   * Demonstrate the load-bearing case the durable callback exists for: a server
-   * whose OAuth is never completed (the user abandons the flow). Nothing inbound
-   * ever transitions it to `ready`/`failed`, so no event or poll can resolve the
-   * banner — only the durable deadline alarm can. We arm a URL-targeted watch
-   * with a short deadline against a server that never connects; when the
-   * deadline elapses, `onServerSettled` fires a `timeout` even though THIS owner
-   * may have hibernated in the meantime and no consumer is watching.
-   *
-   * (A real abandoned-OAuth server would be registered with an `authUrl` and
-   * sit in `AUTHENTICATING`; the timeout mechanics are identical — what matters
-   * is that no inbound transition arrives, so the alarm is the only resolver.)
+   * The load-bearing case: a watch on a server whose OAuth is never completed.
+   * Nothing inbound transitions it, so only the durable deadline alarm can fire
+   * a `timeout` ~4s later (3s deadline + ~1s arm slack) — even if the owner
+   * hibernated and no workspace is watching.
    */
   @callable()
   async armAbandonedAuthWatch(): Promise<{ intentId: string }> {
@@ -146,213 +115,222 @@ export class IdentityDO extends withMcpSettlement(Agent<Env>) {
       { url: "https://auth.example.com/never-completes" },
       {
         callback: "onServerSettled",
-        deadlineMs: 3_000,
+        deadlineSeconds: 3,
         idempotencyKey: "settle:abandoned-auth"
       }
     );
     return { intentId };
   }
 
-  /** A consumer asks to be notified of live changes while it is awake. */
+  /**
+   * Simulate auth expiry: drop the connection and require re-auth. The owner's
+   * status flips to `authenticating`, which the workspace mirrors and renders
+   * as its auth prompt again.
+   */
   @callable()
-  async subscribe(workspaceName: string): Promise<void> {
-    this.subscribers.add(workspaceName);
+  async disconnectAuth(): Promise<void> {
+    try {
+      await this.removeMcpServer(DEMO_SERVER_ID);
+    } catch {
+      // Not connected yet — nothing to drop.
+    }
+    this.publish({ authRequired: true, settlement: null });
   }
 
   /**
    * Durable readiness gate. Runs in this owner DO via the alarm scheduler and
-   * survives hibernation — the reliable trigger to fan out the first
-   * "it's ready" (or "it failed") signal. Must be idempotent.
+   * survives hibernation; records the terminal outcome into published status.
+   * Must be idempotent.
    */
   async onServerSettled(result: MCPServerSettledResult): Promise<void> {
-    await this.ctx.storage.put("lastSettlement", result);
-    // Push the latest connection snapshot (covers `settled`, where the state
-    // advanced) AND the terminal settlement outcome. The outcome
-    // matters most for `timeout`: an abandoned-OAuth deadline fires with no
-    // inbound transition, the connection snapshot still reads `authenticating`,
-    // so the snapshot alone can't tell a consumer "this gave up" — only the
-    // result type can.
-    await this.fanout(DEMO_SERVER_ID);
-    await this.fanoutSettlement(result);
+    this.publish({ settlement: result.type });
   }
 
-  /** Durable, pollable snapshot — read by hibernating consumers on wake. */
+  /** Durable published status — the poll-on-wake source for workspaces. */
   @callable()
-  getServerState(serverId: string): MCPServerStateSnapshot | null {
-    return this.mcp.getPersistedServerState(serverId) ?? null;
-  }
-
-  @callable()
-  async getSettlementLog(): Promise<MCPServerSettledResult | null> {
-    return (
-      (await this.ctx.storage.get<MCPServerSettledResult>("lastSettlement")) ??
-      null
-    );
-  }
-
-  /** Push the current snapshot to every registered (awake) consumer. */
-  private async fanout(serverId: string): Promise<void> {
-    const snapshot = this.mcp.getPersistedServerState(serverId);
-    if (!snapshot) return;
-    for (const name of this.subscribers) {
-      const consumer = await getAgentByName(this.env.WorkspaceDO, name);
-      await consumer.applyLivePush(snapshot);
-    }
+  getStatus(): OwnerStatus {
+    return this.state;
   }
 
   /**
-   * Push a terminal settlement outcome (notably `timeout`) to awake consumers.
-   * NOTE: this is a cross-DO RPC, so it *force-wakes* the consumer — it's an
-   * awake-consumer convenience, not a hibernation-respecting channel. A
-   * hibernating consumer learns the outcome instead by reading the durable
-   * settlement log on its own wake (see `WorkspaceDO.onStart`). The README's
-   * "expanding to a production fan-out" section shows the WebSocket shape that
-   * reaches only awake consumers without force-waking.
+   * Recompute status from the durable snapshot + flags, sync it to our own
+   * browser viewers (`setState`), and push it to awake workspaces (`broadcast`).
    */
-  private async fanoutSettlement(
-    result: MCPServerSettledResult
-  ): Promise<void> {
-    for (const name of this.subscribers) {
-      const consumer = await getAgentByName(this.env.WorkspaceDO, name);
-      await consumer.applySettlement({
-        serverId: DEMO_SERVER_ID,
-        type: result.type
-      });
-    }
+  private publish(patch: Partial<OwnerStatus> = {}): void {
+    const authRequired =
+      "authRequired" in patch ? !!patch.authRequired : this.state.authRequired;
+    const settlement =
+      "settlement" in patch
+        ? (patch.settlement ?? null)
+        : this.state.settlement;
+    const snapshot = this.mcp.getPersistedServerState(DEMO_SERVER_ID);
+    const next: OwnerStatus = {
+      authRequired,
+      error: snapshot?.error,
+      settlement,
+      state: authRequired ? "authenticating" : (snapshot?.state ?? null)
+    };
+
+    this.setState(next); // syncs to the owner panel's browser viewers
+    // Push to awake workspaces over their own sockets. A hibernated workspace
+    // has no socket here, so it is skipped — never force-woken.
+    this.broadcast(
+      JSON.stringify({ status: next, type: "owner-status" } as OwnerStatusPush)
+    );
   }
 }
 
+type WorkspaceState = { banner: Banner };
+
+const INITIAL_BANNER: Banner = {
+  serverId: DEMO_SERVER_ID,
+  settlement: null,
+  state: null,
+  via: "none"
+};
+
 /**
- * A consumer DO. While awake it accepts live pushes; on its own wake it
- * reconciles from the owner's durable snapshot. Both paths are level-triggered:
- * apply the latest state, idempotently.
+ * A consumer DO. It owns no MCP connection — while a browser is viewing it
+ * (awake) it holds a WebSocket to the owner for live status, and on its own
+ * wake it reconciles from the owner's durable published status. Both are
+ * level-triggered: apply the latest, idempotently, into durable Agent state
+ * (which also syncs live to its browser).
  */
-export class WorkspaceDO extends Agent<Env> {
-  private banner: Banner = {
-    serverId: DEMO_SERVER_ID,
-    state: null,
-    via: "none",
-    settlement: null
-  };
+export class WorkspaceDO extends Agent<Env, WorkspaceState> {
+  initialState: WorkspaceState = { banner: INITIAL_BANNER };
 
+  /** The live channel WE open to the owner. Held only while we are awake. */
+  private ownerSocket: WebSocket | null = null;
+  /** In-flight openOwnerSocket promise, so concurrent opens dedupe. */
+  private openingOwnerSocket: Promise<void> | null = null;
+
+  // Poll-on-wake: reconcile whatever changed while we were asleep. If we woke
+  // from WebSocket hibernation with a browser still attached, `onConnect` is
+  // NOT re-run, so the live owner channel would stay closed and the banner
+  // would silently fall back to a one-time poll. Reopen it here whenever a
+  // viewer is present so live pushes resume across hibernation.
   async onStart(): Promise<void> {
-    this.banner = (await this.ctx.storage.get<Banner>("banner")) ?? this.banner;
-
-    // Poll-on-wake: reconcile whatever we missed while hibernating, then keep
-    // taking live pushes. Nothing force-woke us — we pull on our own schedule.
-    // The three owner reads are independent, so fire them together rather than
-    // serially — `onStart` runs under `blockConcurrencyWhile`, so every wake of
-    // this consumer is gated on them completing.
-    const owner = await getAgentByName(this.env.IdentityDO, "identity");
-    const [, snapshot, settlement] = await Promise.all([
-      owner.subscribe(this.name),
-      owner.getServerState(DEMO_SERVER_ID),
-      owner.getSettlementLog()
-    ]);
-
-    if (snapshot) await this.apply(snapshot, "poll-on-wake");
-
-    // Reconcile the terminal settlement outcome on our own wake — the
-    // hibernation-safe path for surfacing a `timeout` we slept through (no
-    // force-wake required; we read the owner's durable record).
-    if (settlement && this.banner.settlement !== settlement.type) {
-      this.banner = { ...this.banner, settlement: settlement.type };
-      // Await the durable write: the next wake reads this back, so it must land
-      // before we return (a floating put could be dropped on eviction).
-      await this.ctx.storage.put("banner", this.banner);
+    if ([...this.getConnections()].length > 0) {
+      await this.openOwnerSocket();
     }
+    await this.reconcile("poll-on-wake");
   }
 
-  /** Live fast-path target (called by the owner while we're awake). */
-  @callable()
-  async applyLivePush(snapshot: MCPServerStateSnapshot): Promise<void> {
-    await this.apply(snapshot, "live-push");
+  // A browser is viewing us → we're awake. Open the live owner channel (we
+  // initiate, so we may wake the owner — that direction is allowed) and
+  // reconcile immediately so the panel is current.
+  async onConnect(_connection: Connection): Promise<void> {
+    await this.openOwnerSocket();
+    await this.reconcile("poll-on-wake");
   }
 
-  /** Live fast-path target for a terminal settlement outcome (e.g. timeout). */
+  // Last viewer gone → free to hibernate. Drop the owner socket so the owner
+  // stops reaching us (it never force-wakes a hibernating workspace).
+  onClose(connection: Connection): void {
+    const stillViewing = [...this.getConnections()].some(
+      (c) => c.id !== connection.id
+    );
+    if (!stillViewing) this.closeOwnerSocket();
+  }
+
+  /** Reconcile from the owner's durable published status (poll-on-wake). */
   @callable()
-  async applySettlement(outcome: {
-    serverId: string;
-    type: MCPServerSettledResult["type"];
-  }): Promise<void> {
-    if (this.banner.settlement === outcome.type) return;
-    this.banner = {
-      ...this.banner,
-      settlement: outcome.type,
-      via: "live-push"
-    };
-    // Await: this banner is the durable record the next poll-on-wake reads.
-    await this.ctx.storage.put("banner", this.banner);
+  async reconcile(via: Banner["via"] = "poll-on-wake"): Promise<Banner> {
+    const owner = await getAgentByName(this.env.IdentityDO, "identity");
+    const status = await owner.getStatus();
+    return this.applyStatus(status, via);
   }
 
   @callable()
   getBanner(): Banner {
-    return this.banner;
+    return this.state.banner;
   }
 
-  private async apply(
-    snapshot: MCPServerStateSnapshot,
-    via: Banner["via"]
-  ): Promise<void> {
-    // Level-triggered: apply the latest state, idempotently. Re-applying the
-    // same state is a no-op render, so neither the live-push nor the
-    // poll-on-wake path needs an ordering cursor — a late older push is
-    // self-correcting on the next push/poll.
-    // Spread to preserve a terminal `settlement` already recorded on the
-    // banner — a snapshot update must not erase it.
-    this.banner = {
-      ...this.banner,
-      serverId: snapshot.serverId,
-      state: snapshot.state,
-      error: snapshot.error,
+  private async openOwnerSocket(): Promise<void> {
+    if (this.ownerSocket) return;
+    // Dedupe concurrent opens: `onStart` and `onConnect` (or two `onConnect`s)
+    // can race, and the `await`s below mean a naive `if (this.ownerSocket)`
+    // guard lets both pass and leak a socket. Share one in-flight promise.
+    if (this.openingOwnerSocket) return this.openingOwnerSocket;
+    this.openingOwnerSocket = this._openOwnerSocket().finally(() => {
+      this.openingOwnerSocket = null;
+    });
+    return this.openingOwnerSocket;
+  }
+
+  private async _openOwnerSocket(): Promise<void> {
+    const owner = await getAgentByName(this.env.IdentityDO, "identity");
+    // Direct stub.fetch upgrade — `x-partykit-room` tells partyserver which
+    // room to route this connection to (we bypass routeAgentRequest here).
+    const res = await owner.fetch("https://identity-do/", {
+      headers: { "x-partykit-room": "identity", Upgrade: "websocket" }
+    });
+    const ws = res.webSocket;
+    if (!ws) return;
+    // This is the consumer's OUTBOUND end of the live channel, so it's a
+    // standard client WebSocket (`ws.accept()`), not a hibernatable DO socket —
+    // `ctx.acceptWebSocket()` only applies to incoming server sockets. While
+    // it's open the WorkspaceDO stays awake; it hibernates once no viewer
+    // remains and `onClose` drops it, then catches up via poll-on-wake on the
+    // next wake.
+    // Another open may have won the race while we awaited — keep the existing
+    // socket and drop this one rather than overwriting (and leaking) it.
+    if (this.ownerSocket) {
+      try {
+        ws.accept();
+        ws.close();
+      } catch {
+        // already closing
+      }
+      return;
+    }
+    ws.accept();
+    this.ownerSocket = ws;
+    ws.addEventListener("message", (event) => {
+      if (typeof event.data !== "string") return;
+      try {
+        const msg = JSON.parse(event.data) as Partial<OwnerStatusPush>;
+        if (msg?.type === "owner-status" && msg.status) {
+          this.applyStatus(msg.status, "live-push");
+        }
+      } catch {
+        // Ignore non-JSON / unrelated frames (e.g. state-sync messages the
+        // owner broadcasts to its own viewers).
+      }
+    });
+    ws.addEventListener("close", () => {
+      if (this.ownerSocket === ws) this.ownerSocket = null;
+    });
+  }
+
+  private closeOwnerSocket(): void {
+    try {
+      this.ownerSocket?.close();
+    } catch {
+      // already closing
+    }
+    this.ownerSocket = null;
+  }
+
+  private applyStatus(status: OwnerStatus, via: Banner["via"]): Banner {
+    // Level-triggered: apply the latest status idempotently. setState is
+    // durable AND synced to our connected browser in one call.
+    const banner: Banner = {
+      error: status.error,
+      serverId: DEMO_SERVER_ID,
+      settlement: status.settlement,
+      state: status.state,
       via
     };
-    // Await the durable write: it is the record the consumer's next wake reads,
-    // so it must persist before this turn returns rather than float and risk
-    // being dropped on eviction.
-    await this.ctx.storage.put("banner", this.banner);
+    this.setState({ banner });
+    return banner;
   }
-}
-
-async function json(value: unknown): Promise<Response> {
-  return new Response(JSON.stringify(value, null, 2), {
-    headers: { "content-type": "application/json" }
-  });
 }
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
-    const url = new URL(request.url);
-    const owner = await getAgentByName(env.IdentityDO, "identity");
-
-    // Drive the owner: connect to the MCP server + arm the durable watch.
-    if (url.pathname === "/connect") {
-      return json(await owner.connectMcp());
-    }
-    // Arm a watch on a server whose OAuth is never completed — the deadline
-    // alarm fires a durable `timeout` ~4s later (the 3s deadline + ~1s arm
-    // slack) with no watcher. Poll /owner/settlement afterwards to see
-    // `{ "type": "timeout" }`.
-    if (url.pathname === "/connect-abandoned-auth") {
-      return json(await owner.armAbandonedAuthWatch());
-    }
-    // The owner's durable snapshot (what a hibernating consumer reads on wake).
-    if (url.pathname === "/owner/state") {
-      return json(await owner.getServerState(DEMO_SERVER_ID));
-    }
-    // The durable settlement decision recorded by onServerSettled.
-    if (url.pathname === "/owner/settlement") {
-      return json(await owner.getSettlementLog());
-    }
-    // A consumer's reconciled banner (subscribes + poll-on-wake on first read).
-    const workspace = url.pathname.match(/^\/workspace\/([^/]+)$/);
-    if (workspace) {
-      const consumer = await getAgentByName(env.WorkspaceDO, workspace[1]);
-      return json(await consumer.getBanner());
-    }
-
-    // Anything else falls through to the SPA assets (the React UI). The Worker
-    // only runs first for the API routes above (see `run_worker_first`).
+    // All UI traffic goes through the Agents WebSocket (useAgent) to the owner
+    // and the workspace; there are no bespoke HTTP API routes.
     return (
       (await routeAgentRequest(request, env, { cors: true })) ??
       new Response("Not found", { status: 404 })
