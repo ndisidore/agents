@@ -19,7 +19,6 @@ import {
   MCPConnectionState
 } from "../../mcp/client-connection.ts";
 import type { MCPServerStateChange } from "../../mcp/client.ts";
-import { RPC_DO_PREFIX } from "../../mcp/rpc.ts";
 import { withMcpSettlement } from "../../experimental/mcp-settlement/index.ts";
 import type { McpSettlementStore } from "../../experimental/mcp-settlement/store.ts";
 import type {
@@ -1208,15 +1207,6 @@ export class TestMcpSettlementAgent extends withMcpSettlement(Agent) {
   async clearSettlementTestState(): Promise<void> {
     this.sql`DELETE FROM cf_agents_mcp_settlement_intents`;
     this.sql`DELETE FROM cf_agents_mcp_servers`;
-    // The connection-state table is created lazily by the manager; only clear
-    // it if it already exists.
-    const stateTable = this.sql<{ name: string }>`
-      SELECT name FROM sqlite_master
-      WHERE type = 'table' AND name = 'cf_agents_mcp_server_state'
-    `;
-    if (stateTable.length > 0) {
-      this.sql`DELETE FROM cf_agents_mcp_server_state`;
-    }
     this.sql`DELETE FROM cf_agents_schedules`;
     await this.ctx.storage.delete(SETTLEMENT_RESULTS_KEY);
     for (const id of Object.keys(this.mcp.mcpConnections)) {
@@ -1429,61 +1419,6 @@ export class TestMcpSettlementAgent extends withMcpSettlement(Agent) {
     `;
   }
 
-  // Write a stale `ready` durable snapshot row directly (no live connection),
-  // simulating a server that was ready before hibernation. Used to prove that a
-  // restore failure for that server still downgrades the stale snapshot.
-  @callable()
-  async seedReadySnapshotRowForTest(id: string): Promise<void> {
-    this.sql`
-      CREATE TABLE IF NOT EXISTS cf_agents_mcp_server_state (
-        server_id TEXT PRIMARY KEY NOT NULL,
-        state TEXT,
-        error TEXT,
-        updated_at INTEGER NOT NULL
-      )
-    `;
-    this.sql`
-      INSERT INTO cf_agents_mcp_server_state (server_id, state, error, updated_at)
-      VALUES (${id}, ${MCPConnectionState.READY}, NULL, ${Date.now()})
-      ON CONFLICT(server_id) DO UPDATE SET
-        state = excluded.state, updated_at = excluded.updated_at
-    `;
-  }
-
-  // Insert an RPC (`rpc:`) server config row directly, so a subsequent
-  // `_restoreRpcMcpServers` tries to restore it. `bindingName` controls whether
-  // the env binding resolves: pass a name absent from `env` to simulate a
-  // deploy that renamed/removed the binding. Pass `corruptOptions: true` to
-  // store unparseable `server_options` (the JSON.parse-throws case).
-  @callable()
-  async seedRpcServerRowForTest(
-    id: string,
-    normalizedName: string,
-    bindingName: string,
-    opts?: { corruptOptions?: boolean }
-  ): Promise<void> {
-    const serverOptions = opts?.corruptOptions
-      ? "{not valid json"
-      : JSON.stringify({ bindingName });
-    this.sql`
-      INSERT OR REPLACE INTO cf_agents_mcp_servers (
-        id, name, server_url, client_id, auth_url, callback_url, server_options
-      ) VALUES (
-        ${id}, ${id}, ${`${RPC_DO_PREFIX}${normalizedName}`}, NULL, NULL,
-        ${""}, ${serverOptions}
-      )
-    `;
-  }
-
-  // Drive the core RPC restore path (the one the Agent runs on wake after
-  // HTTP/OAuth restore). Exposed so tests can assert the failed-restore
-  // snapshot downgrade + per-row isolation.
-  @callable()
-  async restoreRpcServersForTest(): Promise<void> {
-    // @ts-expect-error - accessing private method for testing
-    await this._restoreRpcMcpServers();
-  }
-
   // Re-run the framework onStart wrapper with the restore latch reset, so
   // `restoreConnectionsFromStorage` actually re-executes (and can throw on a
   // corrupt row) rather than early-returning — exercising that the post-restore
@@ -1493,16 +1428,6 @@ export class TestMcpSettlementAgent extends withMcpSettlement(Agent) {
     (this.mcp as unknown as { _isRestored: boolean })._isRestored = false;
     this._onStartRanWithoutSuper = false;
     await this.onStart();
-  }
-
-  @callable()
-  async getPersistedServerStateForTest(serverId: string) {
-    return this.mcp.getPersistedServerState(serverId) ?? null;
-  }
-
-  @callable()
-  async listPersistedServerStatesForTest() {
-    return this.mcp.listPersistedServerStates();
   }
 
   // Reproduce the post-wake reconnect window with fidelity: on a real wake
@@ -1520,31 +1445,8 @@ export class TestMcpSettlementAgent extends withMcpSettlement(Agent) {
     }
   }
 
-  // Simulate a fresh post-hibernation instance: drop the in-memory connections
-  // and reset the manager's restore latch so restoreConnectionsFromStorage
-  // actually RE-RUNS (recreating CONNECTING connections + persisting the
-  // transitional snapshot) rather than early-returning. The `_isRestored` reset
-  // reaches into manager-private state — acceptable in a same-package test
-  // harness, and avoids adding a test-only seam to core.
-  @callable()
-  async simulateColdRestoreForTest(
-    serverId: string
-  ): Promise<{ state: string | null }> {
-    for (const id of Object.keys(this.mcp.mcpConnections)) {
-      delete this.mcp.mcpConnections[id];
-    }
-    (this.mcp as unknown as { _isRestored: boolean })._isRestored = false;
-    await this.mcp.restoreConnectionsFromStorage(this.name);
-    // Capture synchronously here — before this RPC returns and the background
-    // reconnect (which then fails against the unreachable test URL) can advance
-    // the state — so the test observes the transitional snapshot the *restore
-    // step itself* persisted, i.e. the W2.4 synchronous downgrade off `ready`.
-    const snapshot = this.mcp.getPersistedServerState(serverId);
-    return { state: snapshot?.state ?? null };
-  }
-
   // Register a server with a pending OAuth authUrl, keeping the live (default
-  // CONNECTING) connection in place. The first snapshot must report
+  // CONNECTING) connection in place. The resolved state must report
   // AUTHENTICATING, not CONNECTING — the with-connection auth path.
   @callable()
   async seedServerWithAuthUrl(id: string, url: string): Promise<void> {
@@ -1555,11 +1457,6 @@ export class TestMcpSettlementAgent extends withMcpSettlement(Agent) {
       transport: { type: "auto" },
       url
     });
-  }
-
-  @callable()
-  async migrateServerIdForTest(oldId: string, newId: string): Promise<void> {
-    await this.mcp.migrateServerId(oldId, newId, this.name);
   }
 
   @callable()
@@ -1601,45 +1498,6 @@ export class TestMcpSettlementAgent extends withMcpSettlement(Agent) {
     delete this.mcp.mcpConnections[id];
     this.sql`
       UPDATE cf_agents_mcp_servers SET auth_url = ${url} WHERE id = ${id}
-    `;
-  }
-
-  // Simulate an agent upgraded across the snapshot feature: a server config row
-  // with a pending OAuth `auth_url` exists, but no `cf_agents_mcp_server_state`
-  // row was ever written (and there is no live connection). A snapshot read must
-  // derive AUTHENTICATING rather than returning a misleading `null`.
-  @callable()
-  async seedUpgradedAuthPendingServer(id: string, url: string): Promise<void> {
-    this.sql`
-      INSERT OR REPLACE INTO cf_agents_mcp_servers (
-        id, name, server_url, client_id, auth_url, callback_url, server_options
-      ) VALUES (${id}, ${id}, ${url}, NULL, ${url}, ${""}, ${"{}"})
-    `;
-    delete this.mcp.mcpConnections[id];
-    const stateTable = this.sql<{ name: string }>`
-      SELECT name FROM sqlite_master
-      WHERE type = 'table' AND name = 'cf_agents_mcp_server_state'
-    `;
-    if (stateTable.length > 0) {
-      this.sql`DELETE FROM cf_agents_mcp_server_state WHERE server_id = ${id}`;
-    }
-  }
-
-  @callable()
-  async getServerStateRowsForTest(): Promise<
-    { server_id: string; state: string | null }[]
-  > {
-    const stateTable = this.sql<{ name: string }>`
-      SELECT name FROM sqlite_master
-      WHERE type = 'table' AND name = 'cf_agents_mcp_server_state'
-    `;
-    if (stateTable.length === 0) return [];
-    return this.sql<{
-      server_id: string;
-      state: string | null;
-    }>`
-      SELECT server_id, state FROM cf_agents_mcp_server_state
-      ORDER BY server_id
     `;
   }
 
@@ -1849,6 +1707,62 @@ export class TestMcpSettlementAgent extends withMcpSettlement(Agent) {
     } catch (error) {
       return error instanceof Error ? error.message : String(error);
     }
+  }
+
+  // Returns the bounded reconnect-settle wait the recovery anchor would use for
+  // the current set of live intents. Proves the wait is bounded by the soonest
+  // live deadline (capped), so a watch with a deadline longer than the cap-floor
+  // is not cut short into a spurious timeout.
+  @callable()
+  async reconnectSettleWaitMsForTest(): Promise<number> {
+    return (
+      this as unknown as { _reconnectSettleWaitMs(): number }
+    )._reconnectSettleWaitMs();
+  }
+
+  // Run the deadline-timeout handler's pre-delivery steps (arm a fresh bridging
+  // alarm, then record the terminal timeout) but STOP before scheduling the
+  // delivery — simulating a crash/eviction in the settle → delivery gap of
+  // `_cf_checkMcpSettlementIntentDeadline`. The invariant under test: the
+  // now-terminal intent still has a fresh armed deadline alarm to bridge that
+  // gap, so recovery can redeliver (rather than stranding the timeout).
+  @callable()
+  async runDeadlineTimeoutWithoutDeliveryForTest(
+    intentId: string
+  ): Promise<{ settled: boolean }> {
+    const settlement = (this as unknown as { _settlement: McpSettlementStore })
+      ._settlement;
+    const pending = settlement.getPendingDeadline(intentId);
+    if (pending) {
+      await (
+        this as unknown as {
+          _scheduleMcpSettlementDeadline(
+            d: { intentId: string; deadlineAt: number },
+            opts?: { fresh?: boolean }
+          ): Promise<void>;
+        }
+      )._scheduleMcpSettlementDeadline(pending, { fresh: true });
+    }
+    const delivery = settlement.checkSettlementDeadline(intentId);
+    return { settled: !!delivery };
+  }
+
+  // Register two watches under the SAME idempotency key concurrently within one
+  // DO turn (a single Promise.all), exercising the across-`await` reuse path and
+  // the unique partial live-key index as the backstop.
+  @callable()
+  async createTwoConcurrentSameKeyWatchesForTest(
+    serverId: string,
+    idempotencyKey: string
+  ): Promise<{
+    a: { intentId: string; created: boolean };
+    b: { intentId: string; created: boolean };
+  }> {
+    const [a, b] = await Promise.all([
+      this.watchSettlement({ serverId }, { idempotencyKey }),
+      this.watchSettlement({ serverId }, { idempotencyKey })
+    ]);
+    return { a, b };
   }
 
   @callable()

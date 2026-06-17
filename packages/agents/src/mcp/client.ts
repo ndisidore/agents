@@ -32,7 +32,7 @@ import {
 import { toErrorMessage } from "./errors";
 import { RPC_DO_PREFIX } from "./rpc";
 import type { TransportType } from "./types";
-import type { MCPServerRow, MCPServerStateRow } from "./client-storage";
+import type { MCPServerRow } from "./client-storage";
 import type { AgentMcpOAuthProvider } from "./do-oauth-client-provider";
 import { DurableObjectOAuthClientProvider } from "./do-oauth-client-provider";
 
@@ -284,14 +284,15 @@ export type MCPDiscoverResult = {
 
 /**
  * Payload describing a single MCP server's current connection state, emitted by
- * {@link MCPClientManager.onServerStateChanged} when that server changes.
+ * {@link MCPClientManager.onServerStateChanged} when that server changes, and
+ * returned on demand by {@link MCPClientManager.getServerStateChange}.
  *
- * The companion durable snapshot (see
- * {@link MCPClientManager.getPersistedServerState}) is level-triggered: an
- * awake subscriber and a hibernating consumer that polls on wake both reconcile
- * to the latest `{ state, error }`, applied idempotently. There is no ordering
- * cursor — a late-arriving older event is self-correcting on the next
- * push/poll.
+ * The signal is level-triggered: an awake subscriber applies the latest
+ * `{ state, error }` idempotently. There is no ordering cursor — a
+ * late-arriving older event is self-correcting on the next emission. A consumer
+ * that needs to survive its own hibernation persists the latest payload into
+ * its own durable Agent state and reconciles on wake (cross-DO fan-out stays an
+ * app-level concern).
  */
 export type MCPServerStateChange = {
   serverId: string;
@@ -304,18 +305,17 @@ export type MCPServerStateChange = {
    *   connection state — it was downgraded to "no live connection" (e.g.
    *   {@link MCPClientManager.closeConnection}, a failed RPC restore, or an id
    *   migration with no connection). The event still fires on this transition
-   *   so awake subscribers refresh off a stale `ready`; the matching durable
-   *   snapshot is `null` too.
+   *   so awake subscribers refresh off a stale `ready`.
    * - The terminal sentinel `"removed"`, emitted once when the server is
    *   removed — so subscribers that only watch `onServerStateChanged` (the
    *   pre-`onServerRemoved` contract) still observe deletion. `"removed"` is
    *   intentionally *not* a member of {@link MCPConnectionState}: it is a
    *   server-lifecycle fact, not a connection state, and lives on this event
-   *   payload alone (it never appears on a live connection, the durable
-   *   snapshot, or a settlement target). The canonical, structured removal
-   *   signal remains {@link MCPClientManager.onServerRemoved}.
+   *   payload alone (it never appears on a live connection or a settlement
+   *   target). The canonical, structured removal signal remains
+   *   {@link MCPClientManager.onServerRemoved}.
    *
-   * See `design/rfc-mcp-settlement-extraction.md` for the rationale and the
+   * See `design/rfc-durable-mcp-settlement.md` for the rationale and the
    * alternatives considered.
    */
   state: MCPConnectionState | "removed" | null;
@@ -323,37 +323,16 @@ export type MCPServerStateChange = {
 };
 
 /**
- * Durable, pollable snapshot of a server's last-known connection state. Written
- * on every transition and readable without a live transport probe — the
- * enabler for a hibernating consumer DO to reconcile on wake (cross-DO fan-out
- * stays an app-level concern).
- */
-export type MCPServerStateSnapshot = {
-  serverId: string;
-  url: string;
-  state: MCPConnectionState | null;
-  error?: string;
-};
-
-/**
  * Payload emitted by {@link MCPClientManager.onServerRemoved} immediately
- * *before* the server's storage row is deleted, so subscribers can still
- * resolve URL-targeted matches against the server that is going away.
+ * *after* the server's storage row is deleted. It carries the last-known `url`
+ * (captured before deletion) so subscribers can still resolve URL-targeted
+ * matches against the server that has gone away, while a subscriber that
+ * re-reads storage from the handler observes the deletion rather than a stale
+ * row.
  */
 export type MCPServerRemoval = {
   serverId: string;
   url: string;
-};
-
-/**
- * Payload emitted by {@link MCPClientManager.onServerIdMigrated} after a
- * server's id is renamed (in storage and in memory). Subscribers that key
- * durable state by serverId (e.g. settlement watches) re-target from `oldId`
- * to `newId` so a watch registered against the old id is not stranded.
- */
-export type MCPServerIdMigration = {
-  oldId: string;
-  newId: string;
 };
 
 export type MCPClientOAuthCallbackConfig = {
@@ -403,7 +382,6 @@ export class MCPClientManager {
   ) => AgentMcpOAuthProvider;
   private _isRestored = false;
   private _pendingConnections = new Map<string, Promise<void>>();
-  private _serverStateTableReady = false;
 
   /** @internal Protected for testing purposes. */
   protected readonly _onObservabilityEvent =
@@ -423,23 +401,16 @@ export class MCPClientManager {
 
   private readonly _onServerRemoved = new Emitter<MCPServerRemoval>();
   /**
-   * Event that fires immediately *before* a server's storage row is removed.
-   * Carries the last-known `{ serverId, url }` so subscribers (e.g. durable
-   * settlement watches) can resolve URL-targeted matches against the server
-   * that is being removed.
+   * Event that fires immediately *after* a server's storage row is removed
+   * (synchronously within `removeServer`'s turn, with no `await` between the
+   * deletion and the fire). Carries the last-known `{ serverId, url }` captured
+   * before deletion so subscribers (e.g. durable settlement watches) can resolve
+   * URL-targeted matches against the server that has been removed, while a
+   * subscriber that re-reads storage observes the deletion rather than a stale
+   * row.
    */
   public readonly onServerRemoved: Event<MCPServerRemoval> =
     this._onServerRemoved.event;
-
-  private readonly _onServerIdMigrated = new Emitter<MCPServerIdMigration>();
-  /**
-   * Fires after {@link migrateServerId} renames a server (storage + memory),
-   * *before* the post-migration state notification. Carries `{ oldId, newId }`
-   * so serverId-keyed subscribers can follow the rename rather than stranding
-   * durable state under the old id.
-   */
-  public readonly onServerIdMigrated: Event<MCPServerIdMigration> =
-    this._onServerIdMigrated.event;
 
   /**
    * Hooks run by the owning Agent on every wake, *after* all MCP connections
@@ -488,16 +459,10 @@ export class MCPClientManager {
    * (client broadcasts, durable settlement watches) observe a consistent,
    * payload-bearing signal.
    *
-   * Pass the affected `serverId`; the durable snapshot is persisted first, then
-   * an {@link MCPServerStateChange} is emitted (skipped only if the server has
-   * no resolvable state, which never happens for a registered server).
-   * Removal is signalled via {@link onServerRemoved}, not here.
-   */
-  /**
-   * Re-resolve and persist a server's durable snapshot, then emit the state
-   * change. Public seam over {@link _notifyServerStateChanged} so the owning
-   * Agent can downgrade a stale `ready` snapshot after a failed RPC restore
-   * (where the config row still exists but no live connection does).
+   * Public seam over {@link _notifyServerStateChanged} so the owning Agent can
+   * emit a state change after a failed RPC restore (where the config row still
+   * exists but no live connection does), letting awake subscribers refresh off
+   * a stale `ready`.
    *
    * @internal
    */
@@ -506,22 +471,17 @@ export class MCPClientManager {
   }
 
   private _notifyServerStateChanged(serverId: string): void {
-    // Resolve the config row once (indexed single-row read) and share it
-    // between the durable persist and the emitted payload — both would
-    // otherwise hit `cf_agents_mcp_servers` independently for every transition
-    // of every MCP agent.
+    // Resolve the config row once (indexed single-row read) so the emitted
+    // payload doesn't re-scan `cf_agents_mcp_servers` for every transition of
+    // every MCP agent.
     const server = this.getServerFromStorage(serverId);
     if (!server) return;
 
-    // Persist the durable state snapshot *before* emitting, so an awake
-    // subscriber and the next poll-on-wake reader reconcile to the same
-    // latest state.
-    this._persistServerStateForRow(server);
     // Fire unconditionally for a registered server — including a downgrade to a
     // `null` state (closeConnection / failed RPC restore / migration with no
     // connection). Suppressing the `null` transition would leave awake
     // subscribers (broadcastMcpServers, a consumer DO's publish) showing a
-    // stale `ready` even though the durable snapshot is now `null`.
+    // stale `ready`.
     this._onServerStateChanged.fire(this._buildServerStateChange(server));
   }
 
@@ -597,109 +557,6 @@ export class MCPClientManager {
     };
   }
 
-  /**
-   * Lazily create the durable per-server connection-state table. Kept separate
-   * from `cf_agents_mcp_servers` so the snapshot survives the
-   * `INSERT OR REPLACE` rewrites of the config row, and so no core schema
-   * migration is forced on agents that never use MCP.
-   */
-  private _ensureServerStateTable(): void {
-    if (this._serverStateTableReady) return;
-    this.sql(
-      `CREATE TABLE IF NOT EXISTS cf_agents_mcp_server_state (
-        server_id TEXT PRIMARY KEY NOT NULL,
-        state TEXT,
-        error TEXT,
-        updated_at INTEGER NOT NULL
-      )`
-    );
-    this._serverStateTableReady = true;
-  }
-
-  private _getServerStateRow(serverId: string): MCPServerStateRow | undefined {
-    this._ensureServerStateTable();
-    return this.sql<MCPServerStateRow>(
-      `SELECT server_id, state, error, updated_at
-       FROM cf_agents_mcp_server_state WHERE server_id = ?`,
-      serverId
-    )[0];
-  }
-
-  /**
-   * Record the server's current connection state from an already-resolved
-   * config row (no storage scan). The change-guard skips redundant writes (and
-   * the redundant `onServerStateChanged` fire) when neither state nor error
-   * actually changed.
-   */
-  private _persistServerStateForRow(server: MCPServerRow): void {
-    this._ensureServerStateTable();
-
-    const state = this._resolveServerState(server);
-    const conn = this.mcpConnections[server.id];
-    const error = conn?.connectionError ?? null;
-
-    const existing = this._getServerStateRow(server.id);
-    if (existing && existing.state === state && existing.error === error) {
-      return;
-    }
-
-    this.sql(
-      `INSERT INTO cf_agents_mcp_server_state
-         (server_id, state, error, updated_at)
-       VALUES (?, ?, ?, ?)
-       ON CONFLICT(server_id) DO UPDATE SET
-         state = excluded.state,
-         error = excluded.error,
-         updated_at = excluded.updated_at`,
-      server.id,
-      state,
-      error,
-      Date.now()
-    );
-  }
-
-  /**
-   * Durable, pollable snapshot of a server's last-known connection state.
-   * Readable without a live transport probe — the enabler for a hibernating
-   * consumer DO to reconcile on wake. Returns `undefined` for unknown servers.
-   */
-  getPersistedServerState(
-    serverId: string
-  ): MCPServerStateSnapshot | undefined {
-    const server = this.getServerFromStorage(serverId);
-    if (!server) return undefined;
-    const row = this._getServerStateRow(serverId);
-    return {
-      error: row?.error ?? undefined,
-      serverId,
-      // Fall back to deriving the state when no snapshot row has been written
-      // yet — e.g. an agent upgraded with a pending OAuth `auth_url` (no row
-      // exists), or the post-restore window before the connection
-      // re-establishes. Mirrors the resolution the notify chokepoint persists,
-      // so a poll-on-wake reader sees `authenticating` instead of a misleading
-      // `null`.
-      state:
-        (row?.state as MCPConnectionState | null) ??
-        this._resolveServerState(server),
-      url: server.server_url
-    };
-  }
-
-  /** Durable snapshots for every known server. */
-  listPersistedServerStates(): MCPServerStateSnapshot[] {
-    return this.getServersFromStorage().map((server) => {
-      const row = this._getServerStateRow(server.id);
-      return {
-        error: row?.error ?? undefined,
-        serverId: server.id,
-        state:
-          (row?.state as MCPConnectionState | null) ??
-          this._resolveServerState(server),
-        url: server.server_url
-      };
-    });
-  }
-
   // Storage operations
   private saveServerToStorage(server: MCPServerRow): void {
     this.sql(
@@ -772,14 +629,6 @@ export class MCPClientManager {
       newId,
       oldId
     );
-    // Drop the old snapshot row. The snapshot is level-triggered, so the
-    // final `_notifyServerStateChanged(newId)` below repopulates newId from
-    // live state — no version-merge gymnastics needed.
-    this._ensureServerStateTable();
-    this.sql(
-      "DELETE FROM cf_agents_mcp_server_state WHERE server_id = ?",
-      oldId
-    );
 
     // 2. OAuth-related storage keys. The DurableObjectOAuthClientProvider
     //    keys everything under `/{clientName}/{serverId}/...`. Other servers
@@ -811,13 +660,6 @@ export class MCPClientManager {
 
     // 3. In-memory connection + disposables + authProvider.
     this._renameInMemoryConnection(oldId, newId);
-
-    // Let serverId-keyed subscribers (e.g. durable settlement watches) follow
-    // the rename *before* the state notification below — so the subsequent
-    // onServerStateChanged(newId) pass can settle any re-targeted intent whose
-    // server already sits in a target state. Synchronous (Emitter.fire), so
-    // re-targeting lands in this turn ahead of the notify.
-    this._onServerIdMigrated.fire({ newId, oldId });
 
     this._notifyServerStateChanged(newId);
   }
@@ -1119,8 +961,8 @@ export class MCPClientManager {
       server_options: JSON.stringify({ bindingName, props })
     });
     // The RPC connect/discover path notifies *before* this row exists, so the
-    // snapshot was dropped. Notify now that the config row is saved, so
-    // getPersistedServerState() reflects the (already ready) connection.
+    // emitted payload had no config row to resolve. Notify now that the config
+    // row is saved, so subscribers observe the (already ready) connection.
     this._notifyServerStateChanged(id);
   }
 
@@ -1150,11 +992,9 @@ export class MCPClientManager {
       }
 
       // Per-server isolation: a single unreadable/corrupt row (e.g. unparseable
-      // `server_options`) must not abort restore for the rest — otherwise every
-      // server after it in iteration order keeps its stale pre-hibernation
-      // snapshot. On failure, downgrade THIS server's snapshot too, so a cross-DO
-      // consumer polling after wake doesn't read a `ready` that was never
-      // restored.
+      // `server_options`) must not abort restore for the rest. On failure, emit
+      // THIS server's state change too, so an awake subscriber refreshes off a
+      // stale `ready` for a server that was never restored.
       try {
         const existingConn = this.mcpConnections[server.id];
 
@@ -1226,22 +1066,16 @@ export class MCPClientManager {
         // If auth_url exists, OAuth flow is in progress - set state and wait for callback
         if (server.auth_url) {
           conn.connectionState = MCPConnectionState.AUTHENTICATING;
-          // Persist the transitional state synchronously, before any consumer can
-          // poll, so the durable snapshot is bumped off a stale pre-hibernation
-          // value (see below).
+          // Emit the transitional state synchronously so an awake subscriber
+          // refreshes off a stale pre-hibernation value (see below).
           this._notifyServerStateChanged(server.id);
           continue;
         }
 
-        // Persist the transitional CONNECTING state synchronously, BEFORE kicking
-        // off the (non-awaited) background reconnect. Without this, the durable
-        // snapshot keeps serving the pre-hibernation state for the whole reconnect
-        // window — so a cross-DO consumer polling right after the owner wakes
-        // could read a stale `ready` even though the connection (and its auth) is
-        // being re-established and may no longer be valid. `_persistServerState`
-        // only writes (and fires) when the state actually changes, so a
-        // still-ready connection that this downgrades to `connecting` and back
-        // does not churn beyond the real transitions the reconnect already emits.
+        // Emit the transitional CONNECTING state synchronously, BEFORE kicking
+        // off the (non-awaited) background reconnect, so an awake subscriber
+        // (e.g. the owner recomputing its own published state) refreshes off a
+        // stale pre-hibernation `ready` for the whole reconnect window.
         this._notifyServerStateChanged(server.id);
 
         // Start connection in background (don't await) to avoid blocking the DO
@@ -1254,15 +1088,15 @@ export class MCPClientManager {
           `[MCPClientManager] Failed to restore MCP server "${server.id}" on wake:`,
           error
         );
-        // Downgrade the durable snapshot off any stale pre-hibernation value
-        // (e.g. `ready`): with no restored connection, `_resolveServerState`
-        // resolves to `authenticating` (pending auth_url) or `null`, never the
-        // stale `ready`. Guarded so a notify failure can't re-abort the loop.
+        // Emit a state change off any stale pre-hibernation value (e.g.
+        // `ready`): with no restored connection, `_resolveServerState` resolves
+        // to `authenticating` (pending auth_url) or `null`, never the stale
+        // `ready`. Guarded so a notify failure can't re-abort the loop.
         try {
           this._notifyServerStateChanged(server.id);
         } catch (notifyError) {
           console.error(
-            `[MCPClientManager] Failed to downgrade snapshot for "${server.id}" after restore failure:`,
+            `[MCPClientManager] Failed to emit state change for "${server.id}" after restore failure:`,
             notifyError
           );
         }
@@ -1270,7 +1104,7 @@ export class MCPClientManager {
     }
 
     // Mark restore complete even if some servers failed above (they are
-    // isolated and their snapshots downgraded). Restore runs once per DO
+    // isolated and their state changes emitted). Restore runs once per DO
     // instance, so a failed server is retried by the next fresh instance's
     // restore after eviction, not by re-invoking this within the same instance.
     this._isRestored = true;
@@ -1590,10 +1424,10 @@ export class MCPClientManager {
 
     // A pending OAuth `authUrl` means the server is awaiting authorization, not
     // connecting. Reflect that on the freshly-created connection (which defaults
-    // to CONNECTING) so the first state-change payload and durable snapshot
-    // report `authenticating` rather than `connecting` — mirrors the
-    // connectToServer() auth path. `_resolveServerState` keeps "live state wins",
-    // so this must be set on the connection, not inferred only from `auth_url`.
+    // to CONNECTING) so the first state-change payload reports `authenticating`
+    // rather than `connecting` — mirrors the connectToServer() auth path.
+    // `_resolveServerState` keeps "live state wins", so this must be set on the
+    // connection, not inferred only from `auth_url`.
     if (options.authUrl) {
       this.mcpConnections[id].connectionState =
         MCPConnectionState.AUTHENTICATING;
@@ -2129,7 +1963,7 @@ export class MCPClientManager {
     delete this.mcpConnections[id];
   }
 
-  async closeAllConnections(opts: { refreshSnapshots?: boolean } = {}) {
+  async closeAllConnections(opts: { emitStateChanges?: boolean } = {}) {
     const ids = Object.keys(this.mcpConnections);
 
     // Clear all pending connection tracking
@@ -2150,11 +1984,12 @@ export class MCPClientManager {
       })
     );
 
-    // Re-resolve the durable snapshot for each closed-but-still-registered
-    // server so a poll-on-wake consumer doesn't keep reading a stale `ready`.
-    // Skipped during manager dispose (`refreshSnapshots: false`), where the
-    // servers are being torn down rather than merely disconnected.
-    if (opts.refreshSnapshots !== false) {
+    // Emit a state change for each closed-but-still-registered server so an
+    // awake subscriber (broadcastMcpServers, a consumer DO's publish) refreshes
+    // off a stale `ready`. Skipped during manager dispose
+    // (`emitStateChanges: false`), where the servers are being torn down rather
+    // than merely disconnected.
+    if (opts.emitStateChanges !== false) {
       for (const id of ids) {
         if (this.getServerFromStorage(id)) this._notifyServerStateChanged(id);
       }
@@ -2197,15 +2032,13 @@ export class MCPClientManager {
     } finally {
       this.cleanupClosedConnection(id);
 
-      // Re-resolve the durable snapshot for the closed-but-still-registered
-      // server (state is now `null`, or `authenticating` if an OAuth url is
-      // pending) so a poll-on-wake consumer doesn't keep reading a stale
-      // `ready`. In the `finally` so it still runs when `close()` REJECTS — the
-      // in-memory connection was already torn down by `cleanupClosedConnection`
-      // above, so leaving the snapshot at `ready` would advertise a connection
-      // that no longer exists. Only when the server config row still exists —
-      // `removeServer` calls this and then deletes both the server and its
-      // snapshot itself.
+      // Emit a state change for the closed-but-still-registered server (state
+      // is now `null`, or `authenticating` if an OAuth url is pending) so an
+      // awake subscriber doesn't keep showing a stale `ready`. In the `finally`
+      // so it still runs when `close()` REJECTS — the in-memory connection was
+      // already torn down by `cleanupClosedConnection` above. Only when the
+      // server config row still exists — `removeServer` calls this and then
+      // deletes the server itself.
       if (this.getServerFromStorage(id)) this._notifyServerStateChanged(id);
     }
   }
@@ -2228,13 +2061,6 @@ export class MCPClientManager {
       }
     }
     this.removeServerFromStorage(serverId);
-    // Level-triggered snapshot: just delete the row. A later re-add of the
-    // same id starts clean and the next notify repopulates from live state.
-    this._ensureServerStateTable();
-    this.sql(
-      "DELETE FROM cf_agents_mcp_server_state WHERE server_id = ?",
-      serverId
-    );
 
     // Signal removal *after* the storage row is gone, synchronously within this
     // turn (no `await` between deletion and the fires), so any cancellation
@@ -2246,8 +2072,8 @@ export class MCPClientManager {
     //     so subscribers that only watch state changes (the pre-`onServerRemoved`
     //     contract) still learn of the removal instead of silently keeping a
     //     deleted server. The sentinel is event-payload-only — not an
-    //     `MCPConnectionState` — so the FSM, snapshot, and settlement targets
-    //     stay clean (see the RFC).
+    //     `MCPConnectionState` — so the FSM and settlement targets stay clean
+    //     (see the RFC).
     //  2. `onServerRemoved` (the canonical, structured removal event), fired
     //     unconditionally so a serverId-targeted matcher is cancelled even when
     //     the last-known url is unknown (double-remove, or a never-persisted
@@ -2274,13 +2100,12 @@ export class MCPClientManager {
    */
   async dispose(): Promise<void> {
     try {
-      // Teardown, not a user-initiated disconnect: don't rewrite snapshots.
-      await this.closeAllConnections({ refreshSnapshots: false });
+      // Teardown, not a user-initiated disconnect: don't emit state changes.
+      await this.closeAllConnections({ emitStateChanges: false });
     } finally {
       // Dispose manager-level emitters
       this._onServerStateChanged.dispose();
       this._onServerRemoved.dispose();
-      this._onServerIdMigrated.dispose();
       this._onObservabilityEvent.dispose();
       this._postRestoreHooks.length = 0;
     }

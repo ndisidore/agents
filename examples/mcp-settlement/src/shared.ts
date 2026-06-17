@@ -4,7 +4,7 @@
  * copies.
  */
 import type { MCPServerSettledResult } from "agents/experimental/mcp-settlement";
-import type { MCPServerStateSnapshot } from "agents/mcp/client";
+import type { MCPServerStateChange } from "agents/mcp/client";
 
 export const DEMO_SERVER_ID = "demo";
 
@@ -22,11 +22,11 @@ export const WORKSPACES = [
 export type SettlementType = MCPServerSettledResult["type"];
 
 /**
- * The connection state the owner publishes — exactly the durable snapshot's
- * `state` (`MCPConnectionState | null`, where the owner reuses
- * `"authenticating"` for the re-auth-required case).
+ * The connection state the owner publishes — the live state-change payload's
+ * `state` minus the `"removed"` sentinel (`MCPConnectionState | null`, where
+ * the owner reuses `"authenticating"` for the re-auth-required case).
  */
-export type ServerState = MCPServerStateSnapshot["state"];
+export type ServerState = Exclude<MCPServerStateChange["state"], "removed">;
 
 /**
  * The connection/auth status the owner (`IdentityDO`) publishes. It is the

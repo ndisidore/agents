@@ -70,11 +70,17 @@ via poll-on-wake instead.
 export class IdentityDO extends withMcpSettlement(Agent<Env, OwnerStatus>) {
   constructor(ctx, env) {
     super(ctx, env);
-    this.mcp.onServerStateChanged(() => this.publish()); // owner-local event
+    // Re-publish whenever the owned connection changes state.
+    this.mcp.onServerStateChanged((change) => {
+      if (change.serverId === DEMO_SERVER_ID) this.publish();
+    });
   }
   private publish(patch = {}) {
-    const next = /* recompute from getPersistedServerState() + flags */;
-    this.setState(next); // → owner panel (native state sync)
+    // Re-resolve the RAW connection state fresh (live, non-persisting) — don't
+    // read it back from this.state, which holds the derived display value.
+    const live = this.mcp.getServerStateChange(DEMO_SERVER_ID);
+    const next = /* { ...this.state, ...patch, state: derive(live, authFlag) } */;
+    this.setState(next); // → owner panel (native state sync); durable
     this.broadcast(JSON.stringify({ type: "owner-status", status: next })); // → workspaces
   }
 }
@@ -99,7 +105,7 @@ export class WorkspaceDO extends Agent<Env, { banner: Banner }> {
 }
 ```
 
-The `deadlineSeconds` → `timeout` is the part no push or snapshot can cover: if a
+The `deadlineSeconds` → `timeout` is the part no live event can cover: if a
 server never reaches a target state (abandoned OAuth), nothing inbound wakes the
 owner, so only the durable alarm can resolve it. That's why the watch is the
 primitive and the live/poll paths are complements, not substitutes.
@@ -119,4 +125,4 @@ hibernation regardless.
 
 - [`examples/mcp-client`](../mcp-client) — connecting an Agent to remote MCP servers (with OAuth)
 - [`examples/mcp`](../mcp) — building an MCP server with `McpAgent`
-- Design rationale: `design/rfc-mcp-settlement-extraction.md`
+- Design rationale: `design/rfc-durable-mcp-settlement.md`

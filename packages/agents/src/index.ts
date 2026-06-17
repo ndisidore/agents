@@ -835,12 +835,7 @@ function getNextCronTime(cron: string) {
 export type { TransportType } from "./mcp/types";
 export type { RetryOptions } from "./retries";
 export { normalizeServerId, MCP_SERVER_ID_MAX_LENGTH } from "./mcp/client";
-export type {
-  MCPServerStateChange,
-  MCPServerRemoval,
-  MCPServerIdMigration,
-  MCPServerStateSnapshot
-} from "./mcp/client";
+export type { MCPServerStateChange, MCPServerRemoval } from "./mcp/client";
 export {
   DurableObjectOAuthClientProvider,
   type AgentMcpOAuthProvider,
@@ -2454,34 +2449,35 @@ export class Agent<
           }
 
           await this._tryCatch(async () => {
-            // Isolate connection restore from the post-restore recovery hooks:
-            // restore is per-server resilient (a corrupt row is isolated inside
-            // restoreConnectionsFromStorage), but this outer guard is a backstop
-            // for any other restore-step throw (e.g. _restoreRpcMcpServers /
-            // broadcastMcpServers) — it must NOT skip the MCP-subsystem recovery
-            // below, which is the durable backstop for settlement watches
-            // (deadline re-arm / at-least-once redelivery). Log and continue; the
-            // hooks still run against whatever state restored.
+            // Run the MCP-subsystem post-restore recovery hooks on EVERY wake —
+            // even when a restore step throws — because they are the durable
+            // backstop for settlement watches (deadline re-arm / at-least-once
+            // redelivery) and must not be skipped. They run in a `finally`, not
+            // a swallowing catch, so a genuine restore failure still propagates
+            // and aborts the rest of onStart (per-server restore is itself
+            // resilient; this guard only governs an unexpected whole-step throw).
+            //
+            // The hooks run here — not in user onStart — so they can't be
+            // silently skipped by a subclass that forgets super.onStart(), and
+            // after both HTTP/OAuth (restoreConnectionsFromStorage) and RPC MCP
+            // restore so recovery observes fully-restored connection state. They
+            // are awaited because recovery re-arms the durable deadline /
+            // at-least-once delivery drivers (not a fire-and-forget signal);
+            // `_runPostRestoreHooks` is per-hook-isolated so it won't itself
+            // throw and mask a restore error.
             try {
               await this.mcp.restoreConnectionsFromStorage(this.name);
               await this._restoreRpcMcpServers();
               this.broadcastMcpServers();
             } catch (error) {
               console.error(
-                "[Agent] MCP connection restore failed on wake; running post-restore recovery anyway:",
+                "[Agent] MCP connection restore failed on wake; running post-restore recovery, then propagating:",
                 error
               );
+              throw error;
+            } finally {
+              await this.mcp._runPostRestoreHooks();
             }
-
-            // Internal MCP-subsystem recovery (e.g. durable settlement
-            // watches) runs here — not in user onStart — so it can't be
-            // silently skipped by a subclass that forgets super.onStart().
-            // Invoked after both HTTP/OAuth (restoreConnectionsFromStorage)
-            // and RPC MCP restore so recovery observes fully-restored
-            // connection state, and awaited because recovery re-arms the
-            // durable deadline / at-least-once delivery drivers (not a
-            // fire-and-forget signal).
-            await this.mcp._runPostRestoreHooks();
 
             this._checkOrphanedWorkflows();
             await this._checkRunFibers();
@@ -9638,7 +9634,6 @@ export class Agent<
   /** @internal Drop every internal Agents SDK table during top-level destroy. */
   protected _dropInternalTablesForDestroy(): void {
     this.sql`DROP TABLE IF EXISTS cf_agents_mcp_servers`;
-    this.sql`DROP TABLE IF EXISTS cf_agents_mcp_server_state`;
     this.sql`DROP TABLE IF EXISTS cf_agents_state`;
     this.sql`DROP TABLE IF EXISTS cf_agents_schedules`;
     this.sql`DROP TABLE IF EXISTS cf_agents_queues`;
@@ -10576,12 +10571,12 @@ export class Agent<
 
       // Per-server isolation: a single unrestorable RPC server (corrupt
       // `server_options`, a binding renamed/removed by a deploy, or a connect
-      // failure) must not abort restore for the rest. On any failure, downgrade
-      // THIS server's durable snapshot off any stale pre-hibernation `ready`
-      // value — with no live connection `_resolveServerState` resolves to
-      // `null`, so a cross-DO consumer polling after wake doesn't read a
-      // connection that was never restored. (The JSON.parse is INSIDE the try
-      // for the same reason: a corrupt row must not throw past this loop.)
+      // failure) must not abort restore for the rest. On any failure, emit THIS
+      // server's state change off any stale pre-hibernation `ready` value — with
+      // no live connection `_resolveServerState` resolves to `null`, so an awake
+      // subscriber refreshes off a connection that was never restored. (The
+      // JSON.parse is INSIDE the try for the same reason: a corrupt row must not
+      // throw past this loop.)
       try {
         const opts: { bindingName: string; props?: Record<string, unknown> } =
           server.server_options ? JSON.parse(server.server_options) : {};
@@ -10593,7 +10588,7 @@ export class Agent<
           console.warn(
             `[Agent] Cannot restore RPC MCP server "${server.name}": binding "${opts.bindingName}" not found in env`
           );
-          this._downgradeRpcServerSnapshot(server.id);
+          this._notifyRpcServerRestoreFailed(server.id);
           continue;
         }
 
@@ -10618,21 +10613,22 @@ export class Agent<
           `[Agent] Error restoring RPC MCP server "${server.name}":`,
           error
         );
-        this._downgradeRpcServerSnapshot(server.id);
+        this._notifyRpcServerRestoreFailed(server.id);
       }
     }
   }
 
   /**
-   * Downgrade a server's durable snapshot off a stale `ready` after a failed
-   * RPC restore. Guarded so a notify failure can't re-abort the restore loop.
+   * Emit a state change for an RPC server that failed to restore, so an awake
+   * subscriber refreshes off a stale `ready`. Guarded so a notify failure can't
+   * re-abort the restore loop.
    */
-  private _downgradeRpcServerSnapshot(serverId: string): void {
+  private _notifyRpcServerRestoreFailed(serverId: string): void {
     try {
       this.mcp.notifyServerStateChanged(serverId);
     } catch (notifyError) {
       console.error(
-        `[Agent] Failed to downgrade snapshot for RPC server "${serverId}" after restore failure:`,
+        `[Agent] Failed to emit state change for RPC server "${serverId}" after restore failure:`,
         notifyError
       );
     }

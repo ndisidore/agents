@@ -12,7 +12,7 @@ Durable, hibernation-safe "tell me when this MCP server is ready" callbacks for 
 
 The MCP connection lifecycle lives in `this.mcp` (the `MCPClientManager`), but it isn't wired into any durable primitive. Readiness is only observable via in-memory mechanisms (`onServerStateChanged`, `waitForConnections()`) that don't survive hibernation — so apps hand-roll backoff polls and alarm backstops. `withMcpSettlement` expresses MCP readiness as a first-class **durable continuation**: it records the watch durably and fires your callback through `this.schedule()`, re-deriving outstanding watches on wake. No in-memory listener to lose.
 
-It fires **watched or not, hibernated or not**, with no fleet-wide idle wakes (the alarm exists only while a watch is outstanding) — so a consuming app can delete its frontend readiness poll, its in-memory follow-up retry loop, and its DO-alarm backstop. The capability a pollable snapshot can't provide is the **`deadlineSeconds` → timeout**: if a server never reaches a target state (e.g. the user abandons OAuth), nothing inbound wakes the owner, and only a durable alarm can resolve it. That's why the watch is the primitive and [the persisted snapshot](#cross-do-fan-out-app-level) is its complement, not a substitute.
+It fires **watched or not, hibernated or not**, with no fleet-wide idle wakes (the alarm exists only while a watch is outstanding) — so a consuming app can delete its frontend readiness poll, its in-memory follow-up retry loop, and its DO-alarm backstop. The capability a live event can't provide is the **`deadlineSeconds` → timeout**: if a server never reaches a target state (e.g. the user abandons OAuth), nothing inbound wakes the owner, and only a durable alarm can resolve it. That's why the watch is the primitive and [the live state event](#cross-do-fan-out-app-level) is its complement, not a substitute.
 
 The callback fires in the DO that owns the connection. Delivering that signal to _other_ DOs (e.g. sibling `WorkspaceDO`s sharing one `IdentityDO`'s connection) is app routing — see [Cross-DO fan-out](#cross-do-fan-out-app-level), which the SDK is designed to support but does not perform.
 
@@ -25,9 +25,9 @@ The shape this is built for: **one DO owns an MCP connection; one or more other 
                     │ IdentityDO (owns this.mcp)   │
    OAuth completes  │  withMcpSettlement(Agent)    │
    ───────────────▶ │  • durable watch → onSettled │
-                    │  • persists {state}          │
+                    │  • publishes {state}         │
                     └──────────────┬──────────────┘
-                       live event  │  durable snapshot
+                       live event  │  owner's durable state
               (awake consumers)    │  (poll on wake)
                     ┌──────────────┴──────────────┐
                     ▼                              ▼
@@ -37,7 +37,7 @@ The shape this is built for: **one DO owns an MCP connection; one or more other 
             └───────────────┘            └───────────────┘
 ```
 
-Canonical use case: an **auth/connection-status banner**. A user's `IdentityDO` holds the authenticated MCP connection; many `WorkspaceDO`s use it. When OAuth completes (or the server fails), the owner needs a signal that survives its own hibernation — and the workspaces, which wake on their own schedules, need to reflect it without polling. The owner gets the durable `onSettled` callback; each workspace reconciles from the durable snapshot on wake and subscribes to the live event while awake.
+Canonical use case: an **auth/connection-status banner**. A user's `IdentityDO` holds the authenticated MCP connection; many `WorkspaceDO`s use it. When OAuth completes (or the server fails), the owner needs a signal that survives its own hibernation — and the workspaces, which wake on their own schedules, need to reflect it without polling. The owner gets the durable `onSettled` callback; it folds the live `onServerStateChanged` payload into its own durable Agent state, and each workspace reconciles from that published status on wake and subscribes to the live event while awake.
 
 Use the watch directly (no consumers) whenever you just need to **gate** owner-DO work on readiness — e.g. block a tool call until the server is `ready`, hibernation-safe, instead of an in-memory `waitForConnections()`.
 
@@ -47,12 +47,13 @@ Use the watch directly (no consumers) whenever you just need to **gate** owner-D
 
 - Durably records the watch and fires your callback through `this.schedule()` — survives hibernation, at-least-once.
 - Re-derives outstanding watches and re-arms deadlines on wake; settles `ready`/`failed`/custom states, `timeout`, and `cancelled`.
-- Persists each server's last-known `{ state }` for reading without a live probe, and emits a live `onServerStateChanged` payload.
+- Emits a live `onServerStateChanged` payload (`{ serverId, url, state, error? }`) on every transition, and resolves the current state on demand via `this.mcp.getServerStateChange(serverId)`.
 
 **What's yours:**
 
 - Making the callback **idempotent** (delivery is at-least-once).
-- **Re-arming** a new watch if you want to track a server _over time_ (the watch is one-shot — see the snapshot below for level-triggered state).
+- **Re-arming** a new watch if you want to track a server _over time_ (the watch is one-shot — see [the live state event](#cross-do-fan-out-app-level) for level-triggered state).
+- **Persisting** the latest `{ state, error }` into your own durable Agent state if you want a poll-on-wake surface for consumers (the canonical pattern below).
 - **All cross-DO routing**: pushing to / polling from other DOs, any subscriber registry, multi-DO fan-out. The SDK never pushes to or tracks consumers.
 
 ## Quick Start
@@ -108,7 +109,7 @@ Registers a durable, **one-shot** watch. Returns `{ intentId, created }` (`creat
 - `opts.deadlineSeconds` — **required**; fires a `timeout` result if no watched state is reached in time. Required by design: every watch arms a durable deadline alarm, so (a) the abandoned-OAuth case — where nothing inbound ever wakes the owner — always resolves, and (b) every intent has a self-cleaning terminal path, so a live watch row can never leak. The deadline is **authoritative**: if it elapses before a watched state is reached, the watch settles as `timeout`, not a late `settled`. **Deadlines are approximate**: the alarm scheduler floors fire times to whole seconds and the watch adds ~1s of slack so a timeout is never lost to flooring, so a `timeout` may fire up to ~1s after `deadlineSeconds`. Don't use it where sub-second precision matters. The unit aligns with `this.schedule()`, whose native unit is also seconds; multi-day deadlines are fine (a single durable alarm, no idle wakes).
 - `opts.idempotencyKey` — optional; dedupes concurrent registrations.
 
-It fires **once** — it's a durable latch/gate, not an ongoing subscription. To track a server's state **over time** (e.g. a banner: ready → needs-reauth → ready), don't re-arm watches in a loop (you'd miss transitions in the gap between firing and re-arming); read the durable snapshot instead — see [Cross-DO fan-out](#cross-do-fan-out-app-level).
+It fires **once** — it's a durable latch/gate, not an ongoing subscription. To track a server's state **over time** (e.g. a banner: ready → needs-reauth → ready), don't re-arm watches in a loop (you'd miss transitions in the gap between firing and re-arming); fold the live `onServerStateChanged` event into your own durable state instead — see [Cross-DO fan-out](#cross-do-fan-out-app-level).
 
 ### `cancelMcpSettlementWatch(intentId)`
 
@@ -138,14 +139,27 @@ How the guarantee is actually built — the layering matters:
 The owner DO's callback is the durable trigger; routing to consumer DOs is yours. The SDK provides two building blocks so you don't have to poll:
 
 1. **Awake consumers** subscribe to the live signal. `this.mcp.onServerStateChanged` carries `{ serverId, url, state, error? }`; wire it to your consumers however you like (WebSocket, RPC).
-2. **Hibernating consumers reconcile on their own wake** by reading the owner's durable snapshot — no live transport probe required:
+2. **Hibernating consumers reconcile on their own wake** by reading the owner's published status. The SDK does not ship a durable snapshot table — the owner folds the live event into its own durable Agent state (which survives hibernation) and exposes that:
 
 ```typescript
-// On the connection-owning (owner) DO — expose the durable snapshot:
-class OwnerAgent extends withMcpSettlement(Agent<Env>) {
+// On the connection-owning (owner) DO — fold the live event into durable state:
+class OwnerAgent extends withMcpSettlement(
+  Agent<Env, { state: string | null }>
+) {
+  constructor(ctx, env) {
+    super(ctx, env);
+    this.mcp.onServerStateChanged((change) => {
+      if (change.serverId !== MY_SERVER_ID) return;
+      // setState is durable AND syncs to connected viewers; "removed" → null.
+      this.setState({
+        state: change.state === "removed" ? null : change.state
+      });
+    });
+  }
+
   @callable()
-  getServerState(serverId: string) {
-    return this.mcp.getPersistedServerState(serverId); // { state, ... }
+  getServerState() {
+    return this.state; // durable, survives hibernation
   }
 }
 
@@ -153,7 +167,7 @@ class OwnerAgent extends withMcpSettlement(Agent<Env>) {
 class ConsumerAgent extends Agent<Env> {
   async onStart() {
     // Poll-on-wake, then keep applying live updates — both level-triggered.
-    this.apply(await getOwner(this).getServerState(MY_SERVER_ID));
+    this.apply(await getOwner(this).getServerState());
     // Live updates while awake (app wiring — e.g. the owner relays its event):
     onAuthUpdate((snap) => this.apply(snap));
   }
@@ -167,4 +181,4 @@ class ConsumerAgent extends Agent<Env> {
 }
 ```
 
-The snapshot is **level-triggered**: the live event and the durable snapshot both describe the latest `{ state }`, applied idempotently — there is no ordering cursor to track, and a late-arriving older push is self-correcting on the next push/poll. `state` includes `"authenticating"` (derived from a pending OAuth `auth_url`), so the banner's re-auth signal is pollable. Closing a connection without removing the server (`closeConnection` / `closeAllConnections`) refreshes the snapshot too, so a poll-on-wake consumer sees the server drop out of `ready` rather than reading a stale value. The SDK never pushes to consumers or tracks a subscriber registry — multi-DO routing stays your code.
+The signal is **level-triggered**: the live event describes the latest `{ state }`, applied idempotently — there is no ordering cursor to track, and a late-arriving older push is self-correcting on the next push/poll. `state` includes `"authenticating"` (derived from a pending OAuth `auth_url`), so the banner's re-auth signal is captured. Closing a connection without removing the server (`closeConnection` / `closeAllConnections`) emits a state change too, so the owner drops the server out of `ready` rather than holding a stale value. The SDK never pushes to consumers or tracks a subscriber registry — multi-DO routing stays your code.

@@ -75,9 +75,13 @@ export class IdentityDO extends withMcpSettlement(Agent<Env, OwnerStatus>) {
   constructor(ctx: AgentContext, env: Env) {
     super(ctx, env);
     // Recompute + publish whenever the owned connection's state changes
-    // (connect/discover/ready/fail, and the close on disconnect). This is the
-    // owner-local SDK event; getting it to a workspace is the broadcast below.
-    this.mcp.onServerStateChanged(() => this.publish());
+    // (connect/discover/ready/fail, and the close on disconnect). `publish()`
+    // re-resolves the live state from the manager — that resolved value, folded
+    // into our own durable Agent state, IS the poll-on-wake surface (no separate
+    // SDK snapshot). Getting it to a workspace is the broadcast in `publish()`.
+    this.mcp.onServerStateChanged((change) => {
+      if (change.serverId === DEMO_SERVER_ID) this.publish();
+    });
   }
 
   /** Connect to the bundled MCP server and arm a durable readiness watch. */
@@ -153,8 +157,15 @@ export class IdentityDO extends withMcpSettlement(Agent<Env, OwnerStatus>) {
   }
 
   /**
-   * Recompute status from the durable snapshot + flags, sync it to our own
-   * browser viewers (`setState`), and push it to awake workspaces (`broadcast`).
+   * Recompute status, sync it to our own browser viewers (`setState`), and push
+   * it to awake workspaces (`broadcast`). The connection `state`/`error` are
+   * **re-resolved fresh** from the manager each call via `getServerStateChange`
+   * (the live, non-persisting read) — never read back from `this.state.state`,
+   * which holds the *derived* display value (`"authenticating"` reuses the
+   * connection-state slot for the re-auth case, so reading it back would make
+   * that display value sticky). Everything else (auth flag, latest settlement)
+   * is owner-local. Agent state survives hibernation, so it is the durable
+   * poll-on-wake source workspaces read via `getStatus()`.
    */
   private publish(patch: Partial<OwnerStatus> = {}): void {
     const authRequired =
@@ -163,12 +174,16 @@ export class IdentityDO extends withMcpSettlement(Agent<Env, OwnerStatus>) {
       "settlement" in patch
         ? (patch.settlement ?? null)
         : this.state.settlement;
-    const snapshot = this.mcp.getPersistedServerState(DEMO_SERVER_ID);
+    // Live read: `undefined` once the server is removed (Disconnect Auth). The
+    // `"removed"` sentinel never appears on this resolved read (it's only on the
+    // explicit removal event), but narrow it out for the type.
+    const live = this.mcp.getServerStateChange(DEMO_SERVER_ID);
+    const liveState = live?.state === "removed" ? null : (live?.state ?? null);
     const next: OwnerStatus = {
       authRequired,
-      error: snapshot?.error,
+      error: live?.error,
       settlement,
-      state: authRequired ? "authenticating" : (snapshot?.state ?? null)
+      state: authRequired ? "authenticating" : liveState
     };
 
     this.setState(next); // syncs to the owner panel's browser viewers

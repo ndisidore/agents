@@ -15,16 +15,24 @@ import type {
 const MCP_SETTLEMENT_INTENT_TTL_MS = 24 * 60 * 60 * 1000;
 
 /**
- * Upper bound on how long wake recovery keeps the DO alive waiting for
+ * Upper bound (cap) on how long wake recovery keeps the DO alive waiting for
  * background MCP reconnects to settle before re-deriving. `restoreConnections-
  * FromStorage` kicks off reconnects without awaiting them, so on a wake that
  * only ran recovery the DO could otherwise hibernate before the reconnect
  * reaches READY/FAILED — and a live watch would fall through to its deadline
- * (timeout) instead of settling. 10s comfortably covers the default per-server
- * retry budget (3 attempts, 500ms→5000ms backoff) while never pinning the DO
- * open indefinitely.
+ * (timeout) instead of settling.
+ *
+ * `waitForConnections` resolves as soon as every pending connection reaches a
+ * terminal state (READY or FAILED — failure ends the retry budget, it does not
+ * hang), so this cap is only hit by a transport that stays pending; for that
+ * pathological case, timing the watch out is acceptable. The actual wait is
+ * `min(this cap, time until the soonest live deadline)` — see
+ * `_recoverMcpSettlementIntents` — so the wait is never longer than a watch's
+ * own deadline (a reachable-but-slow server still settles instead of producing
+ * a spurious `timeout`). The cap is generous enough to cover realistic
+ * per-server retry budgets without pinning the DO open.
  */
-const MCP_SETTLEMENT_RECONNECT_SETTLE_MS = 10_000;
+const MCP_SETTLEMENT_RECONNECT_SETTLE_CAP_MS = 60_000;
 
 /**
  * Constructor shape for an `Agent` (or `Agent` subclass) the mixin can wrap.
@@ -46,6 +54,12 @@ export interface McpSettlementMixin {
    * required `deadlineSeconds` elapses, or the watch is cancelled / the server
    * is removed. Delivery is at-least-once and survives hibernation; callbacks
    * must be idempotent.
+   *
+   * `callback` must name a member of the Agent (`keyof this`); that it is a
+   * method accepting an {@link MCPServerSettledResult} is enforced at runtime
+   * (a tighter `this`-mapped type does not resolve for polymorphic-`this`
+   * callers — e.g. a subclass wrapping this method — so it is intentionally not
+   * imposed at the type level).
    */
   watchMcpServerSettled<Callback extends keyof this>(
     target: MCPServerSettlementTarget,
@@ -121,6 +135,24 @@ export function withMcpSettlement<TBase extends AgentConstructor>(
       // only the schedule() delivery is deferred fire-and-forget.
       this._settlementDisposables.add(
         this.mcp.onServerStateChanged((change) => {
+          // Crash-window repair: a live intent persisted before its deadline
+          // alarm was recorded (registration evicted mid-arm) has no alarm to
+          // bridge a terminal write. A restore-time transition can reach a
+          // target state on wake BEFORE recovery's re-arm pass runs (recovery
+          // runs after MCP restore), so the synchronous match below deliberately
+          // skips such unarmed intents; arm them durably here first, then settle.
+          // Rare — gated on a cheap COUNT, runs only when an unarmed intent
+          // actually exists.
+          if (this._settlement.hasUnarmedLiveSettlementIntents()) {
+            this.ctx.waitUntil(
+              this._repairUnarmedSettlementDeadlines().catch((error) => {
+                console.error(
+                  "[mcp-settlement] failed to repair unarmed deadline on state change:",
+                  error
+                );
+              })
+            );
+          }
           for (const delivery of this._settlement.checkSettlementIntentsForServer(
             change.serverId
           )) {
@@ -140,20 +172,6 @@ export function withMcpSettlement<TBase extends AgentConstructor>(
           )) {
             this._deliverMcpSettlement(delivery);
           }
-        })
-      );
-
-      // Server id migration re-targets serverId-keyed intents from oldId →
-      // newId so a watch registered against the old id follows the rename
-      // instead of hanging to its deadline (or forever). Fires before the
-      // post-migration onServerStateChanged(newId), so the state-changed pass
-      // above settles any re-targeted intent already in a target state.
-      this._settlementDisposables.add(
-        this.mcp.onServerIdMigrated((migration) => {
-          this._settlement.retargetSettlementIntents(
-            migration.oldId,
-            migration.newId
-          );
         })
       );
     }
@@ -353,7 +371,21 @@ export function withMcpSettlement<TBase extends AgentConstructor>(
     /**
      * @internal Scheduled deadline handler. Fires the timeout once the deadline
      * has actually elapsed; if it runs early (clock/flooring slack) it re-arms
-     * with a fresh schedule for the remaining time instead of dropping it.
+     * for the remaining time instead of dropping it.
+     *
+     * Crash safety: the one-shot deadline row that is firing right now is
+     * deleted by the alarm loop the moment this returns. If the handler threw
+     * partway — before settling (a transient SQL read), or after the terminal
+     * write but before the delivery schedule landed — and that firing row were
+     * the only armed alarm, the intent would be stranded (live, or terminal-but-
+     * undelivered) with nothing to wake redelivery; application-error throws are
+     * swallowed after the retry budget, so re-throwing alone does NOT preserve
+     * the row. So we re-arm a *fresh* deadline alarm up front, before anything
+     * that can throw, and settle against THAT alarm (not the firing row). On
+     * success the delivery cancels the fresh alarm; on any failure the fresh
+     * alarm survives and a future wake re-runs recovery (rederive replays a
+     * live re-check or a terminal-but-undelivered row) — so a timeout is never
+     * silently lost.
      */
     async _cf_checkMcpSettlementIntentDeadline(payload: {
       intentId: string;
@@ -361,20 +393,22 @@ export function withMcpSettlement<TBase extends AgentConstructor>(
       const pending = this._settlement.getPendingDeadline(payload.intentId);
       if (!pending) return; // already settled / cancelled / gone
 
+      // Re-arm a fresh deadline before settling. This both covers the early-fire
+      // case (the firing row is about to be deleted) AND guarantees a surviving
+      // bridging alarm if the settle/delivery below throws. `markSettlement-
+      // DeadlineScheduled` now records the FRESH schedule id, so the settle path
+      // (no `deadlineScheduleIsFiring`) cancels the fresh alarm in the normal
+      // delivery-before-deadline-cancel order rather than the firing row.
+      await this._scheduleMcpSettlementDeadline(pending, { fresh: true });
+
       if (pending.deadlineAt > Date.now()) {
-        // Fired early — re-arm with a *fresh* schedule (the firing row is about
-        // to be deleted by the alarm loop) rather than no-op-and-drop.
-        await this._scheduleMcpSettlementDeadline(pending, { fresh: true });
+        // Fired early (clock/flooring slack) — the fresh re-arm above covers the
+        // remaining time; don't settle a timeout yet.
         return;
       }
 
-      // The deadline alarm firing right now IS this intent's deadline schedule;
-      // the alarm loop deletes it after we return, so don't have the delivery
-      // cancel it (that's handled durably). A timeout via wake re-derivation,
-      // in contrast, leaves the original alarm armed and must cancel it.
       const delivery = this._settlement.checkSettlementDeadline(
-        payload.intentId,
-        { deadlineScheduleIsFiring: true }
+        payload.intentId
       );
       if (!delivery) return;
 
@@ -424,10 +458,19 @@ export function withMcpSettlement<TBase extends AgentConstructor>(
       // watch could hibernate and fall through to its deadline (timeout). Anchor
       // a bounded wait so the DO stays alive until the reconnects settle, then
       // re-derive — turning a missed-transition timeout back into a real settle.
-      if (this._settlement.hasLiveSettlementIntents()) {
+      //
+      // Bound the wait by the time remaining until the SOONEST live deadline (no
+      // point waiting past it — past the deadline a `timeout` IS the correct
+      // result, and that deadline's own alarm provides the next wake to re-derive
+      // for any longer-lived watches), capped by
+      // `MCP_SETTLEMENT_RECONNECT_SETTLE_CAP_MS`. Bounding by the deadline (not a
+      // fixed sub-deadline window) keeps a reachable-but-slow server from being
+      // hibernated mid-reconnect into a spurious `timeout`.
+      const reconnectWaitMs = this._reconnectSettleWaitMs();
+      if (reconnectWaitMs > 0) {
         this.ctx.waitUntil(
           this.mcp
-            .waitForConnections({ timeout: MCP_SETTLEMENT_RECONNECT_SETTLE_MS })
+            .waitForConnections({ timeout: reconnectWaitMs })
             .then(() => this._scheduleDerivedMcpSettlementDeliveries())
             .catch((error) => {
               console.error(
@@ -437,6 +480,55 @@ export function withMcpSettlement<TBase extends AgentConstructor>(
             })
         );
       }
+    }
+
+    /**
+     * @internal How long to keep the DO alive for background reconnects on a
+     * recovery-only wake: `min(cap, time until the soonest live deadline)`, or
+     * `0` when no live intent remains. Never exceeds a watch's own deadline (so
+     * a reachable-but-slow server is not cut short into a spurious `timeout`),
+     * and never exceeds the cap (so the DO isn't pinned by a hung transport).
+     */
+    private _reconnectSettleWaitMs(): number {
+      const now = Date.now();
+      let soonestRemaining = Infinity;
+      for (const deadline of this._settlement.listLiveSettlementDeadlines()) {
+        soonestRemaining = Math.min(
+          soonestRemaining,
+          deadline.deadlineAt - now
+        );
+      }
+      if (!Number.isFinite(soonestRemaining)) return 0; // no live intents
+      return Math.min(
+        MCP_SETTLEMENT_RECONNECT_SETTLE_CAP_MS,
+        Math.max(0, soonestRemaining)
+      );
+    }
+
+    /**
+     * @internal Arm any live intents whose deadline alarm was never recorded
+     * (the registration crash window), then settle those that already match —
+     * off the durable path, not the synchronous fast-path. Arming first restores
+     * the "an armed alarm always bridges the terminal write" invariant for
+     * intents that a restore-time transition would otherwise settle unbridged.
+     * Idempotent: arming an already-armed deadline dedupes, and re-derivation is
+     * safe to run repeatedly.
+     */
+    private async _repairUnarmedSettlementDeadlines(): Promise<void> {
+      await Promise.allSettled(
+        this._settlement.listUnarmedLiveSettlementDeadlines().map((deadline) =>
+          this._scheduleMcpSettlementDeadline(deadline).catch((error) => {
+            console.error(
+              `[mcp-settlement] failed to arm crash-window deadline for intent "${deadline.intentId}":`,
+              error
+            );
+          })
+        )
+      );
+
+      // The intents armed above now have a bridging alarm — settle any that
+      // already match current state.
+      await this._scheduleDerivedMcpSettlementDeliveries();
     }
 
     /**

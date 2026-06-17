@@ -117,7 +117,7 @@ export class McpSettlementStore {
       WHERE status = 'live'
     `;
 
-    // serverId-targeted matching/retargeting looks intents up by server_id.
+    // serverId-targeted matching looks intents up by server_id.
     this.agent.sql`
       CREATE INDEX IF NOT EXISTS cf_agents_mcp_settlement_server
       ON cf_agents_mcp_settlement_intents(server_id)
@@ -190,7 +190,7 @@ export class McpSettlementStore {
     return [...new Set(states)];
   }
 
-  private assertCompatibleSettlementIntent(
+  private assertIdempotentReuseMatches(
     existing: MCPSettlementIntentRow,
     requested: {
       callback: string;
@@ -289,6 +289,47 @@ export class McpSettlementStore {
     );
   }
 
+  /**
+   * Whether any live intent has no armed deadline alarm — the registration
+   * crash window (intent persisted before its `deadline_schedule_id` was
+   * recorded). Such intents must NOT be settled on the synchronous awake
+   * fast-path: with no alarm armed, a terminal write would be unbridged (an
+   * eviction before the fire-and-forget delivery schedule lands would leave the
+   * intent terminal-but-undelivered with no alarm to wake redelivery). The
+   * mixin arms them on a durable repair path first. Cheap COUNT over the live
+   * partial index; returns `true` only in the rare crash-window case.
+   */
+  hasUnarmedLiveSettlementIntents(): boolean {
+    return (
+      (this.agent.sql<{ n: number }>`
+        SELECT COUNT(*) AS n FROM cf_agents_mcp_settlement_intents
+        WHERE status = 'live' AND deadline_at IS NOT NULL
+          AND deadline_schedule_id IS NULL
+      `[0]?.n ?? 0) > 0
+    );
+  }
+
+  /**
+   * Live intents whose deadline alarm was never recorded (the registration
+   * crash window). The mixin re-arms these (idempotent) before settling, so the
+   * "an armed alarm always bridges the terminal write" invariant holds even when
+   * a restore-time state change would otherwise settle them on the awake path.
+   */
+  listUnarmedLiveSettlementDeadlines(): LiveSettlementDeadline[] {
+    return this.agent.sql<MCPSettlementIntentRow>`
+      SELECT id, idempotency_key, server_id, url, callback, target_states,
+        deadline_at, status, result_json, delivery_schedule_id,
+        deadline_schedule_id, created_at, fired_at
+      FROM cf_agents_mcp_settlement_intents
+      WHERE status = 'live' AND deadline_at IS NOT NULL
+        AND deadline_schedule_id IS NULL
+    `.map((intent) => ({
+      deadlineAt: intent.deadline_at!,
+      intentId: intent.id,
+      scheduleId: undefined
+    }));
+  }
+
   private listLiveSettlementIntents(): MCPSettlementIntentRow[] {
     return this.agent.sql<MCPSettlementIntentRow>`
       SELECT id, idempotency_key, server_id, url, callback, target_states,
@@ -349,8 +390,14 @@ export class McpSettlementStore {
   private getStateForSettlementServer(
     server: MCPServerRow
   ): MCPConnectionState | undefined {
+    // Mirror the manager's canonical `_resolveServerState`: a live connection
+    // state wins, else a pending OAuth `auth_url` implies AUTHENTICATING. Guard
+    // on `conn?.connectionState` (not merely `conn`) so the two resolvers cannot
+    // disagree on a connection object that exists with a falsy state — that
+    // would otherwise resolve here as the falsy value while the manager falls
+    // through to AUTHENTICATING.
     const conn = this.servers.mcpConnections[server.id];
-    if (conn) return conn.connectionState;
+    if (conn?.connectionState) return conn.connectionState;
     if (server.auth_url) return MCPConnectionState.AUTHENTICATING;
     return undefined;
   }
@@ -379,8 +426,7 @@ export class McpSettlementStore {
    */
   private settleIntent(
     intent: MCPSettlementIntentRow,
-    result: MCPServerSettledResult,
-    opts: { deadlineScheduleIsFiring?: boolean } = {}
+    result: MCPServerSettledResult
   ): MCPSettlementDelivery | undefined {
     // Re-read under the single-threaded DO turn: only the row that is still
     // `live` may transition. Guards against fabricating a delivery for an
@@ -406,17 +452,15 @@ export class McpSettlementStore {
 
     // The stored JSON is the canonical payload used for schedule idempotency.
     //
-    // Carry the still-armed deadline schedule so the delivery cancels it —
-    // EXCEPT when the deadline alarm is the one currently firing (the normal
-    // `_cf_checkMcpSettlementIntentDeadline` → timeout path), where the alarm
-    // loop deletes that row itself and we must not touch it. A timeout produced
-    // by wake re-derivation, by contrast, leaves the registration-time deadline
-    // alarm armed, so it MUST be cancelled here or it fires a spurious wake.
+    // Carry the recorded deadline schedule so the delivery cancels it (in the
+    // delivery-before-deadline-cancel order). Callers always settle against a
+    // bridging alarm that is distinct from any currently-firing deadline row
+    // (the deadline handler re-arms a fresh alarm before settling), so the
+    // delivery cancels exactly that bridging alarm — no spurious wake is left
+    // behind, and a firing one-shot row is reaped by the alarm loop independently.
     return {
       callback: current.callback,
-      deadlineScheduleId: opts.deadlineScheduleIsFiring
-        ? undefined
-        : (current.deadline_schedule_id ?? undefined),
+      deadlineScheduleId: current.deadline_schedule_id ?? undefined,
       intentId: current.id,
       result: JSON.parse(resultJson) as MCPServerSettledResult
     };
@@ -483,11 +527,17 @@ export class McpSettlementStore {
 
     if (
       typeof options.deadlineSeconds !== "number" ||
-      !Number.isFinite(options.deadlineSeconds) ||
+      !Number.isInteger(options.deadlineSeconds) ||
       options.deadlineSeconds <= 0
     ) {
+      // Integer required: `schedule()` floors fire times to whole seconds, and
+      // idempotent-reuse matching compares a seconds value reconstructed from
+      // the stored `deadline_at` (`round((deadline_at - created_at)/1000)`)
+      // against this raw value — a fractional deadline would round-trip to a
+      // different number and spuriously fail a same-key retry with identical
+      // options. Require whole seconds so the contract is exact.
       throw new Error(
-        "watchMcpServerSettled deadlineSeconds must be a positive number"
+        "watchMcpServerSettled deadlineSeconds must be a positive integer (whole seconds)"
       );
     }
 
@@ -510,14 +560,29 @@ export class McpSettlementStore {
         options.idempotencyKey
       );
       if (existing) {
-        this.assertCompatibleSettlementIntent(existing, {
+        // The conflict check (same key, different options) is an intentional
+        // API error and must propagate. The subsequent settle-now, however, is
+        // a best-effort optimization — guard it so a corrupt/unparseable
+        // existing row (hand-edit / partial write) can't throw a brand-new
+        // registration out. The existing intent's own deadline alarm and wake
+        // re-derivation still drive it to a terminal state, matching the
+        // per-row isolation the state-change / rederive loops already apply.
+        this.assertIdempotentReuseMatches(existing, {
           callback: options.callback,
           deadlineSeconds: options.deadlineSeconds,
           serverId: targetServerId,
           states,
           url: targetUrl
         });
-        const delivery = this.checkIntentAgainstCurrentState(existing);
+        let delivery: MCPSettlementDelivery | undefined;
+        try {
+          delivery = this.checkIntentAgainstCurrentState(existing);
+        } catch (error) {
+          console.error(
+            `[mcp-settlement] reuse settle-now skipped intent "${existing.id}":`,
+            error
+          );
+        }
         return {
           created: false,
           deliveries: delivery ? [delivery] : [],
@@ -669,24 +734,6 @@ export class McpSettlementStore {
     return deliveries;
   }
 
-  /**
-   * Re-target live serverId-keyed intents when a server's id is migrated
-   * (renamed). URL-targeted intents are untouched — the url is unchanged by a
-   * rename, so they keep resolving. Driven by the core `onServerIdMigrated`
-   * event, before the post-migration state notification, so the subsequent
-   * state-changed pass settles any re-targeted intent already in a target
-   * state. The idempotency uniqueness invariant is preserved: there can be at
-   * most one live row per key, so moving its `server_id` cannot collide.
-   */
-  retargetSettlementIntents(oldId: string, newId: string): void {
-    if (oldId === newId) return;
-    this.agent.sql`
-      UPDATE cf_agents_mcp_settlement_intents
-      SET server_id = ${newId}
-      WHERE server_id = ${oldId} AND status = 'live'
-    `;
-  }
-
   checkSettlementIntentsForServer(serverId: string): MCPSettlementDelivery[] {
     const server = this.servers.listServers().find((s) => s.id === serverId);
     if (!server) return [];
@@ -694,6 +741,13 @@ export class McpSettlementStore {
     const deliveries: MCPSettlementDelivery[] = [];
     for (const intent of this.listLiveSettlementIntents()) {
       try {
+        // Skip a live intent with no armed deadline alarm: settling it on this
+        // synchronous fast-path would leave the terminal write unbridged (no
+        // alarm to wake redelivery if an eviction lands before the delivery
+        // schedule does). The mixin arms it on the durable repair path and
+        // settles it there. Only the rare registration crash-window hits this.
+        if (intent.deadline_schedule_id === null) continue;
+
         const matchesServerId = intent.server_id === serverId;
         const matchesUrl = intent.url
           ? this.settlementUrlsMatch(intent.url, server.server_url)
@@ -732,7 +786,7 @@ export class McpSettlementStore {
 
   checkSettlementDeadline(
     intentId: string,
-    opts: { now?: number; deadlineScheduleIsFiring?: boolean } = {}
+    opts: { now?: number } = {}
   ): MCPSettlementDelivery | undefined {
     const now = opts.now ?? Date.now();
     const intent = this.getSettlementIntent(intentId);
@@ -752,9 +806,7 @@ export class McpSettlementStore {
       type: "timeout",
       url: intent.url ?? undefined
     };
-    return this.settleIntent(intent, result, {
-      deadlineScheduleIsFiring: opts.deadlineScheduleIsFiring
-    });
+    return this.settleIntent(intent, result);
   }
 
   /**
