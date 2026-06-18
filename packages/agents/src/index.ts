@@ -1472,8 +1472,13 @@ export class Agent<
    */
   private _persistenceHookMode: "new" | "old" | "none" = "none";
 
-  /** True when this agent runs as a facet (sub-agent) inside a parent. */
-  private _isFacet = false;
+  /**
+   * True when this agent runs as a facet (sub-agent) inside a parent.
+   * @internal `protected` so experimental subsystems (e.g. the MCP settlement
+   * mixin) can refuse a deployment whose durability assumptions don't hold for
+   * facets, where schedule rows live in the root DO rather than locally.
+   */
+  protected _isFacet = false;
 
   private _protocolBroadcastExcludeIds = new Set<string>();
   private _cf_currentSubAgentBridge?: SubAgentConnectionBridgeLike;
@@ -2449,29 +2454,37 @@ export class Agent<
           }
 
           await this._tryCatch(async () => {
-            // Run the MCP-subsystem post-restore recovery hooks on EVERY wake —
-            // even when a restore step throws — because they are the durable
-            // backstop for settlement watches (deadline re-arm / at-least-once
-            // redelivery) and must not be skipped. They run in a `finally`, not
-            // a swallowing catch, so a genuine restore failure still propagates
-            // and aborts the rest of onStart (per-server restore is itself
-            // resilient; this guard only governs an unexpected whole-step throw).
+            // Run the general-purpose MCP post-restore hooks on EVERY wake. This
+            // is a core MCP extension point (`registerPostRestoreHook`), not a
+            // settlement-specific seam — settlement is simply its first consumer.
+            // Any MCP subsystem that must reconcile durable state on wake hangs
+            // off it.
             //
             // The hooks run here — not in user onStart — so they can't be
-            // silently skipped by a subclass that forgets super.onStart(), and
-            // after both HTTP/OAuth (restoreConnectionsFromStorage) and RPC MCP
-            // restore so recovery observes fully-restored connection state. They
-            // are awaited because recovery re-arms the durable deadline /
-            // at-least-once delivery drivers (not a fire-and-forget signal);
-            // `_runPostRestoreHooks` is per-hook-isolated so it won't itself
-            // throw and mask a restore error.
+            // silently skipped by a subclass that forgets super.onStart(). They
+            // are awaited because a consumer may re-arm durable drivers
+            // (e.g. alarms / at-least-once delivery), not just fire-and-forget
+            // signals; `_runPostRestoreHooks` is per-hook-isolated so it won't
+            // itself throw and mask a restore error.
+            //
+            // They run in a `finally`, so they run even when a restore step
+            // throws. On the happy path they observe fully-restored connection
+            // state (after both HTTP/OAuth restoreConnectionsFromStorage and RPC
+            // MCP restore). On the throw path they observe whatever restored
+            // before the failure — partial state — which is the intended safe
+            // degradation: a hook that re-derives finds no target match yet and
+            // defers (e.g. a settlement watch falls through to its own deadline)
+            // rather than settling early against incomplete state. The restore
+            // error still propagates after the hooks run, aborting the rest of
+            // onStart; per-server restore is itself resilient, so this guard only
+            // governs an unexpected whole-step throw.
             try {
               await this.mcp.restoreConnectionsFromStorage(this.name);
               await this._restoreRpcMcpServers();
               this.broadcastMcpServers();
             } catch (error) {
               console.error(
-                "[Agent] MCP connection restore failed on wake; running post-restore recovery, then propagating:",
+                "[Agent] MCP connection restore failed on wake; running post-restore recovery against partial state, then propagating:",
                 error
               );
               throw error;

@@ -87,6 +87,12 @@ export class IdentityDO extends withMcpSettlement(Agent<Env, OwnerStatus>) {
   /** Connect to the bundled MCP server and arm a durable readiness watch. */
   @callable()
   async connectMcp(): Promise<{ intentId: string }> {
+    // Clear the re-auth flag up front so the state-change events fired by
+    // addMcpServer below resolve as `connecting`/`ready` rather than briefly
+    // re-rendering the sticky `authenticating` left over from a prior
+    // disconnectAuth(). (publish() derives `state` from authRequired.)
+    this.setState({ ...this.state, authRequired: false, settlement: null });
+
     const { id } = await this.addMcpServer(
       DEMO_SERVER_ID,
       this.env.DemoMcpServer as unknown as DurableObjectNamespace<McpAgent>,
@@ -133,6 +139,10 @@ export class IdentityDO extends withMcpSettlement(Agent<Env, OwnerStatus>) {
    */
   @callable()
   async disconnectAuth(): Promise<void> {
+    // Set the re-auth flag up front so the synchronous `"removed"` state-change
+    // event fired by removeMcpServer below already publishes `authenticating`,
+    // not a transient `null` (publish() derives `state` from authRequired).
+    this.setState({ ...this.state, authRequired: true, settlement: null });
     try {
       await this.removeMcpServer(DEMO_SERVER_ID);
     } catch {
@@ -288,18 +298,22 @@ export class WorkspaceDO extends Agent<Env, WorkspaceState> {
     // it's open the WorkspaceDO stays awake; it hibernates once no viewer
     // remains and `onClose` drops it, then catches up via poll-on-wake on the
     // next wake.
-    // Another open may have won the race while we awaited — keep the existing
-    // socket and drop this one rather than overwriting (and leaking) it.
-    if (this.ownerSocket) {
+    ws.accept();
+    // Two races can have resolved while we awaited the (owner-waking) upgrade:
+    //   1. another open won and already set `this.ownerSocket`; or
+    //   2. the LAST viewer disconnected — `onClose` ran `closeOwnerSocket()`,
+    //      which only nulled the (still-unassigned) field. Assigning now would
+    //      pin this WorkspaceDO awake forever with zero viewers (a
+    //      non-hibernatable client socket the owner keeps broadcasting to).
+    // In either case, drop this socket rather than keep it.
+    if (this.ownerSocket || [...this.getConnections()].length === 0) {
       try {
-        ws.accept();
         ws.close();
       } catch {
         // already closing
       }
       return;
     }
-    ws.accept();
     this.ownerSocket = ws;
     ws.addEventListener("message", (event) => {
       if (typeof event.data !== "string") return;
@@ -337,6 +351,18 @@ export class WorkspaceDO extends Agent<Env, WorkspaceState> {
       state: status.state,
       via
     };
+    // Genuinely idempotent: skip the durable write + browser state-sync frame
+    // when nothing changed (a poll and a live-push often carry identical
+    // status), so repeated reconciles don't churn.
+    const prev = this.state.banner;
+    if (
+      prev.state === banner.state &&
+      prev.settlement === banner.settlement &&
+      prev.error === banner.error &&
+      prev.via === banner.via
+    ) {
+      return prev;
+    }
     this.setState({ banner });
     return banner;
   }

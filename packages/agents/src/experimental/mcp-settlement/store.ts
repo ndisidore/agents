@@ -55,6 +55,31 @@ export interface SettlementServerSource {
  * The store carries no in-memory event emitters: hibernation safety comes from
  * the durable rows here plus the Agent's durable schedules, never from
  * in-memory signals.
+ *
+ * **Co-commit invariant.** The mixin inserts the intent row and arms its
+ * deadline alarm (a `cf_agents_mcp_settlement_intents` INSERT followed by a
+ * `cf_agents_schedules` INSERT) with no intervening I/O `await`, so both rows
+ * land in a single atomic implicit transaction — committed together or not at
+ * all. This is a documented Durable Objects guarantee: `sql.exec` writes with
+ * no intervening `await` are coalesced into one atomic implicit transaction
+ * (see Cloudflare's "Rules of Durable Objects" — write coalescing / output
+ * gates). A committed live intent therefore *always* has a committed deadline
+ * alarm; only the alarm's id (`deadline_schedule_id`, recorded by a later
+ * UPDATE) can be missing after a crash in that window. A missing id costs at
+ * most one redundant alarm fire (the delivery has no id to cancel, so the orphan
+ * alarm fires once later and no-ops via the guarded deadline handler) — never a
+ * lost timeout. This is why matching paths settle such intents directly rather
+ * than special-casing a "no alarm armed" state: that state cannot exist.
+ *
+ * Two preconditions keep this invariant true; both are enforced by the mixin:
+ *  - **No intervening I/O `await`** between `registerSettlementIntent`'s intent
+ *    INSERT and the deadline `schedule()`'s row INSERT. The current path stays
+ *    synchronous up to `setAlarm` (which runs *after* the schedule INSERT);
+ *    introducing an `await` on storage/network in that window would break
+ *    coalescing and reopen the lost-timeout gap.
+ *  - **Both rows share one DO's storage.** A facet/sub-agent routes its
+ *    schedules to the root DO via RPC (a cross-DO `await`), so the mixin rejects
+ *    use on a facet.
  */
 export class McpSettlementStore {
   private agent: SettlementSqlProvider;
@@ -109,19 +134,15 @@ export class McpSettlementStore {
 
     // Partial index over live intents: every state-change match
     // (`checkSettlementIntentsForServer`), live-deadline scan, and the bounded
-    // wake re-derive filters on `status = 'live'`. Keeps those off a full-table
-    // scan as terminal rows accumulate before their TTL prune.
+    // wake re-derive filters on `status = 'live'` and then filters server_id /
+    // url in JS. Keeps those off a full-table scan as terminal rows accumulate
+    // before their TTL prune. (No separate `server_id` index: no query filters
+    // on `server_id` in SQL — matching scans the live partial index above — so
+    // such an index would only add write amplification.)
     this.agent.sql`
       CREATE INDEX IF NOT EXISTS cf_agents_mcp_settlement_live
       ON cf_agents_mcp_settlement_intents(status)
       WHERE status = 'live'
-    `;
-
-    // serverId-targeted matching looks intents up by server_id.
-    this.agent.sql`
-      CREATE INDEX IF NOT EXISTS cf_agents_mcp_settlement_server
-      ON cf_agents_mcp_settlement_intents(server_id)
-      WHERE server_id IS NOT NULL
     `;
 
     this._tableReady = true;
@@ -290,44 +311,29 @@ export class McpSettlementStore {
   }
 
   /**
-   * Whether any live intent has no armed deadline alarm — the registration
-   * crash window (intent persisted before its `deadline_schedule_id` was
-   * recorded). Such intents must NOT be settled on the synchronous awake
-   * fast-path: with no alarm armed, a terminal write would be unbridged (an
-   * eviction before the fire-and-forget delivery schedule lands would leave the
-   * intent terminal-but-undelivered with no alarm to wake redelivery). The
-   * mixin arms them on a durable repair path first. Cheap COUNT over the live
-   * partial index; returns `true` only in the rare crash-window case.
+   * If an intent is terminal but its delivery schedule was never recorded (a
+   * crash between the synchronous settle write and the awaited delivery
+   * `schedule()`), return the delivery to replay from the recorded
+   * `result_json`. Returns `undefined` for live, missing, or already-scheduled
+   * intents.
+   *
+   * Used by the deadline handler so the armed alarm bridges this gap even on an
+   * *already-awake* DO — where the cold-wake recovery scan
+   * (`rederiveSettlementIntents`) never runs, so the alarm is the only remaining
+   * durable driver for a terminal-but-undelivered row.
    */
-  hasUnarmedLiveSettlementIntents(): boolean {
-    return (
-      (this.agent.sql<{ n: number }>`
-        SELECT COUNT(*) AS n FROM cf_agents_mcp_settlement_intents
-        WHERE status = 'live' AND deadline_at IS NOT NULL
-          AND deadline_schedule_id IS NULL
-      `[0]?.n ?? 0) > 0
-    );
-  }
-
-  /**
-   * Live intents whose deadline alarm was never recorded (the registration
-   * crash window). The mixin re-arms these (idempotent) before settling, so the
-   * "an armed alarm always bridges the terminal write" invariant holds even when
-   * a restore-time state change would otherwise settle them on the awake path.
-   */
-  listUnarmedLiveSettlementDeadlines(): LiveSettlementDeadline[] {
-    return this.agent.sql<MCPSettlementIntentRow>`
-      SELECT id, idempotency_key, server_id, url, callback, target_states,
-        deadline_at, status, result_json, delivery_schedule_id,
-        deadline_schedule_id, created_at, fired_at
-      FROM cf_agents_mcp_settlement_intents
-      WHERE status = 'live' AND deadline_at IS NOT NULL
-        AND deadline_schedule_id IS NULL
-    `.map((intent) => ({
-      deadlineAt: intent.deadline_at!,
+  checkUndeliveredTerminal(
+    intentId: string
+  ): MCPSettlementDelivery | undefined {
+    const intent = this.getSettlementIntent(intentId);
+    if (!intent || intent.status === "live") return undefined;
+    if (intent.delivery_schedule_id || !intent.result_json) return undefined;
+    return {
+      callback: intent.callback,
+      deadlineScheduleId: intent.deadline_schedule_id ?? undefined,
       intentId: intent.id,
-      scheduleId: undefined
-    }));
+      result: JSON.parse(intent.result_json) as MCPServerSettledResult
+    };
   }
 
   private listLiveSettlementIntents(): MCPSettlementIntentRow[] {
@@ -561,12 +567,13 @@ export class McpSettlementStore {
       );
       if (existing) {
         // The conflict check (same key, different options) is an intentional
-        // API error and must propagate. The subsequent settle-now, however, is
-        // a best-effort optimization — guard it so a corrupt/unparseable
-        // existing row (hand-edit / partial write) can't throw a brand-new
-        // registration out. The existing intent's own deadline alarm and wake
-        // re-derivation still drive it to a terminal state, matching the
-        // per-row isolation the state-change / rederive loops already apply.
+        // API error and must propagate. Do NOT settle inline here: the mixin
+        // settles every path — created and idempotent reuse alike — through the
+        // same arm-the-deadline-first, then `checkSettlementNow()` discipline,
+        // so a reuse onto a crash-window intent that was never armed is armed
+        // (idempotently) before its terminal write, and an already-armed reuse
+        // intent dedupes. Returning the existing id (without a terminal write)
+        // keeps reuse symmetric with creation.
         this.assertIdempotentReuseMatches(existing, {
           callback: options.callback,
           deadlineSeconds: options.deadlineSeconds,
@@ -574,18 +581,8 @@ export class McpSettlementStore {
           states,
           url: targetUrl
         });
-        let delivery: MCPSettlementDelivery | undefined;
-        try {
-          delivery = this.checkIntentAgainstCurrentState(existing);
-        } catch (error) {
-          console.error(
-            `[mcp-settlement] reuse settle-now skipped intent "${existing.id}":`,
-            error
-          );
-        }
         return {
           created: false,
-          deliveries: delivery ? [delivery] : [],
           intentId: existing.id
         };
       }
@@ -613,13 +610,12 @@ export class McpSettlementStore {
     // guarantees an armed alarm bridges the (synchronous) terminal write and
     // the (awaited) delivery schedule, so an eviction in that gap still has an
     // alarm to wake recovery. Settling inline here would write the terminal row
-    // before any alarm exists (the P1 lost-callback window for already-matching
+    // before any alarm exists (the lost-callback window for already-matching
     // servers).
     this.insertSettlementIntent(intent);
 
     return {
       created: true,
-      deliveries: [],
       intentId: intent.id
     };
   }
@@ -741,13 +737,6 @@ export class McpSettlementStore {
     const deliveries: MCPSettlementDelivery[] = [];
     for (const intent of this.listLiveSettlementIntents()) {
       try {
-        // Skip a live intent with no armed deadline alarm: settling it on this
-        // synchronous fast-path would leave the terminal write unbridged (no
-        // alarm to wake redelivery if an eviction lands before the delivery
-        // schedule does). The mixin arms it on the durable repair path and
-        // settles it there. Only the rare registration crash-window hits this.
-        if (intent.deadline_schedule_id === null) continue;
-
         const matchesServerId = intent.server_id === serverId;
         const matchesUrl = intent.url
           ? this.settlementUrlsMatch(intent.url, server.server_url)

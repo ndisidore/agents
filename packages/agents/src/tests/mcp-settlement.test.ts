@@ -608,8 +608,8 @@ describe("durable MCP settlement watches", () => {
   });
 
   it("arms the deadline before settling a matching intent on recovery (bridge)", async () => {
-    // P1: a registration that crashed after inserting the live intent but before
-    // recording deadline_schedule_id leaves a live intent with no armed alarm.
+    // A registration that crashed after inserting the live intent but before
+    // recording deadline_schedule_id leaves a live intent with no recorded alarm id.
     // Recovery must arm the deadline BEFORE re-deriving/settling, so that if the
     // server already matches and recovery is then evicted before scheduling the
     // delivery, an armed deadline alarm still bridges the gap and wakes
@@ -627,7 +627,7 @@ describe("durable MCP settlement watches", () => {
     );
 
     // Arm-then-rederive, but stop before scheduling the delivery (the eviction
-    // window). With the fix, the now-terminal intent carries an armed deadline.
+    // window). The terminal intent must still carry an armed deadline alarm.
     await stub.recoverArmThenRederiveWithoutDeliveryForTest();
 
     const rows = await stub.getSettlementIntentRows();
@@ -741,6 +741,62 @@ describe("durable MCP settlement watches", () => {
     expect(first.created).toBe(true);
   });
 
+  it("rejects a same-key reuse with a different deadline or states set", async () => {
+    // `assertIdempotentReuseMatches` must reject a reuse whose options differ —
+    // not just the callback (covered above) but also `deadlineSeconds` and the
+    // `states` set. The deadline check round-trips through
+    // `round((deadline_at - created_at) / 1000)`, which is exact only because
+    // `deadlineSeconds` is a required positive integer.
+    const stub = await settlementAgent("reuse-mismatch");
+
+    const first = await stub.createSettlementWatchByUrl(
+      "https://mcp.example.com/mismatch",
+      {
+        deadlineSeconds: 60,
+        idempotencyKey: "mismatch-key",
+        states: [MCPConnectionState.READY]
+      }
+    );
+    expect(first.created).toBe(true);
+
+    // Different deadlineSeconds → conflict.
+    const deadlineMsg = await stub.tryCreateSettlementWatchByUrl(
+      "https://mcp.example.com/mismatch",
+      {
+        deadlineSeconds: 90,
+        idempotencyKey: "mismatch-key",
+        states: [MCPConnectionState.READY]
+      }
+    );
+    expect(deadlineMsg).toContain("different options");
+
+    // Different states set → conflict.
+    const statesMsg = await stub.tryCreateSettlementWatchByUrl(
+      "https://mcp.example.com/mismatch",
+      {
+        deadlineSeconds: 60,
+        idempotencyKey: "mismatch-key",
+        states: [MCPConnectionState.READY, MCPConnectionState.FAILED]
+      }
+    );
+    expect(statesMsg).toContain("different options");
+
+    // Exactly matching options still dedupe (no throw, no new row).
+    const sameMsg = await stub.tryCreateSettlementWatchByUrl(
+      "https://mcp.example.com/mismatch",
+      {
+        deadlineSeconds: 60,
+        idempotencyKey: "mismatch-key",
+        states: [MCPConnectionState.READY]
+      }
+    );
+    expect(sameMsg).toBe("created");
+    const rows = await stub.getSettlementIntentRows();
+    expect(
+      rows.filter((r) => r.idempotency_key === "mismatch-key")
+    ).toHaveLength(1);
+  });
+
   // The real hibernation path. Unlike the "recovers on wake" test (which keeps
   // a READY connection so rederive settles synchronously), here the connection
   // is mid-reconnect (CONNECTING) when recovery runs — reproducing the post-wake
@@ -790,7 +846,7 @@ describe("durable MCP settlement watches", () => {
   });
 
   it("keeps an armed deadline bridging an immediate settle so recovery can redeliver", async () => {
-    // P1: when the target already matches at registration, the terminal row is
+    // When the target already matches at registration, the terminal row is
     // written synchronously and the delivery is scheduled across an await. If
     // the DO is evicted in that gap there must STILL be an armed alarm (the
     // deadline) so recovery is guaranteed a wake — otherwise the callback is
@@ -832,8 +888,104 @@ describe("durable MCP settlement watches", () => {
     expect(results[0].type).toBe("settled");
   });
 
+  it("replays a terminal-but-undelivered intent from the firing deadline alarm on a warm DO", async () => {
+    // When the delivery schedule is lost AFTER the terminal write while the DO
+    // stays AWAKE (a throwing schedule() write, no eviction), cold-wake recovery
+    // never runs — the armed deadline alarm is the only remaining durable
+    // driver. When it fires on the warm DO the handler must replay the
+    // undelivered row, not no-op on "already terminal" — otherwise the callback
+    // is stranded until an unrelated activation, violating at-least-once.
+    const stub = await settlementAgent("warm-undelivered-replay");
+    await stub.seedMcpServer(
+      "wr-server",
+      "https://mcp.example.com/wr",
+      MCPConnectionState.READY
+    );
+
+    // Terminal row, delivery not scheduled yet, deadline alarm still armed.
+    const { intentId, settled } =
+      await stub.armSettleWithoutDeliveryForTest("wr-server");
+    expect(settled).toBe(true);
+
+    let rows = await stub.getSettlementIntentRows();
+    let row = rows.find((r) => r.id === intentId)!;
+    expect(row.status).toBe("settled");
+    expect(row.delivery_schedule_id).toBeNull();
+    const deadlineScheduleId = row.deadline_schedule_id;
+    expect(deadlineScheduleId).toBeTruthy();
+
+    // Fire the deadline alarm WITHOUT running recovery (the warm-DO path —
+    // `runDurableObjectAlarm` dispatches the due schedule but does not re-run
+    // onStart/recovery). The handler finds the row terminal-but-undelivered and
+    // schedules the replay delivery.
+    await stub.backdateSchedule(deadlineScheduleId!, 1);
+    await runDurableObjectAlarm(stub);
+    await waitForSettlementSchedule(stub, intentId);
+    await runDurableObjectAlarm(stub);
+
+    const results = await stub.getSettlementResults();
+    expect(results).toHaveLength(1);
+    expect(results[0].type).toBe("settled");
+
+    rows = await stub.getSettlementIntentRows();
+    row = rows.find((r) => r.id === intentId)!;
+    expect(row.delivery_schedule_id).toBeTruthy(); // replay recorded
+  });
+
+  it("arms a fresh bridging deadline when replaying a warm undelivered row, and self-cleans", async () => {
+    // The warm replay schedules a delivery that can itself reject through its
+    // retry budget. Before doing so the handler must arm a FRESH bridging
+    // deadline (the firing one-shot row is deleted on return), so a persistent
+    // scheduling failure still leaves a durable driver to retry instead of
+    // stranding the row until a cold wake. The fresh alarm fires once more and
+    // self-cleans: once the delivery has landed it no-ops, with no second
+    // callback.
+    const stub = await settlementAgent("warm-replay-bridge");
+    await stub.seedMcpServer(
+      "wrb-server",
+      "https://mcp.example.com/wrb",
+      MCPConnectionState.READY
+    );
+
+    const { intentId } =
+      await stub.armSettleWithoutDeliveryForTest("wrb-server");
+    const oldDeadlineId = (await stub.getSettlementIntentRows()).find(
+      (r) => r.id === intentId
+    )!.deadline_schedule_id;
+    expect(oldDeadlineId).toBeTruthy();
+
+    // Fire the deadline alarm: the handler replays the delivery AND arms a fresh
+    // bridging deadline. The old firing row is reaped by the alarm loop.
+    await stub.backdateSchedule(oldDeadlineId!, 1);
+    await runDurableObjectAlarm(stub);
+
+    const deadlineSchedules = (await stub.getSettlementScheduleRows()).filter(
+      (s) => s.callback === "_cf_checkMcpSettlementIntentDeadline"
+    );
+    // Exactly one deadline alarm remains — a fresh bridge distinct from the
+    // (now-reaped) firing row.
+    expect(deadlineSchedules).toHaveLength(1);
+    expect(deadlineSchedules[0].id).not.toBe(oldDeadlineId);
+
+    // Deliver, then fire the fresh bridge: it must no-op (already delivered),
+    // never a second callback.
+    await waitForSettlementSchedule(stub, intentId);
+    await runDurableObjectAlarm(stub);
+    const freshDeadline = (await stub.getSettlementScheduleRows()).find(
+      (s) => s.callback === "_cf_checkMcpSettlementIntentDeadline"
+    );
+    if (freshDeadline) {
+      await stub.backdateSchedule(freshDeadline.id, 1);
+      await runDurableObjectAlarm(stub);
+    }
+
+    const results = await stub.getSettlementResults();
+    expect(results).toHaveLength(1);
+    expect(results[0].type).toBe("settled");
+  });
+
   it("settles ready via post-reconnect re-derivation instead of timing out", async () => {
-    // P1: recovery runs while a restored connection is still CONNECTING (the
+    // Recovery runs while a restored connection is still CONNECTING (the
     // background reconnect is not awaited). On a wake that only ran recovery,
     // nothing keeps the DO alive for the reconnect, so the watch would fall
     // through to its deadline. The bounded waitForConnections → re-derive that
@@ -869,7 +1021,7 @@ describe("durable MCP settlement watches", () => {
   });
 
   it("settles a duplicate-URL watch against the server that reached a target state", async () => {
-    // P2: two servers share a URL. The second reaches ready while the first is
+    // Two servers share a URL. The second reaches ready while the first is
     // still connecting — the watch must settle (against the ready one), not
     // re-resolve to the first stored server and stay live.
     const stub = await settlementAgent("dup-url-settle");
@@ -903,7 +1055,7 @@ describe("durable MCP settlement watches", () => {
   });
 
   it("keeps a duplicate-URL watch live until the last matching server is removed", async () => {
-    // P2: removing ONE of several servers sharing a URL must not cancel a
+    // Removing ONE of several servers sharing a URL must not cancel a
     // URL-targeted watch that another server still satisfies.
     const stub = await settlementAgent("dup-url-cancel");
     await stub.seedMcpServer(
@@ -986,11 +1138,12 @@ describe("durable MCP settlement watches", () => {
     expect(change!.state).toBe(MCPConnectionState.AUTHENTICATING);
   });
 
-  // The registration crash window: an intent persisted with a deadline but no
-  // deadline_schedule_id (crash between the two INSERTs). Recovery is the sole
-  // armer of the only timeout driver — it must re-arm, and the timeout must
-  // then fire with no watcher. This is the load-bearing G2 guarantee, and the
-  // reason wake recovery is an *awaited* hook, not a fire-and-forget event.
+  // A live intent persisted with a deadline but no deadline alarm at all (a
+  // harsher proxy for the crash window where only the alarm's id went
+  // unrecorded). Recovery is the sole armer of the timeout driver — it must
+  // re-arm, and the timeout must then fire with no watcher. This is the
+  // load-bearing abandoned-OAuth guarantee, and the reason wake recovery is an
+  // *awaited* hook, not a fire-and-forget event.
   it("re-arms the deadline on wake when registration crashed before arming it", async () => {
     const stub = await settlementAgent("crash-window");
 
@@ -1216,12 +1369,14 @@ describe("durable MCP settlement watches", () => {
     );
   });
 
-  it("arms a crash-window intent before settling it on a restore-time transition", async () => {
-    // A live intent persisted before its deadline alarm was recorded
-    // (registration evicted mid-arm) has no bridging alarm. On wake a restore
-    // transition can reach a target state BEFORE recovery re-arms — the awake
-    // fast-path must NOT settle it unbridged. It is armed on the durable repair
-    // path first, then settled, so a bridging alarm always exists.
+  it("settles a crash-window intent directly on a restore-time transition", async () => {
+    // A live intent persisted before its deadline alarm id was recorded
+    // (registration evicted mid-arm). Per the co-commit invariant its alarm
+    // still exists in production (only the id is missing), so the awake
+    // fast-path settles it directly — no skip, no separate repair pass. The
+    // delivery simply carries no id to cancel; the orphan alarm fires once later
+    // and no-ops. (This helper inserts the row WITHOUT an alarm, an even harsher
+    // case, and the watch is still delivered exactly once.)
     const stub = await settlementAgent("c1-unarmed-awake");
 
     await stub.seedMcpServer(
@@ -1237,11 +1392,10 @@ describe("durable MCP settlement watches", () => {
 
     let rows = await stub.getSettlementIntentRows();
     expect(rows[0].status).toBe("live");
-    expect(rows[0].deadline_schedule_id).toBeNull(); // unarmed
+    expect(rows[0].deadline_schedule_id).toBeNull(); // id never recorded
 
-    // A real READY transition fires onServerStateChanged. The synchronous match
-    // skips the unarmed intent; the durable repair (ctx.waitUntil) arms it then
-    // settles it.
+    // A real READY transition fires onServerStateChanged; the synchronous match
+    // settles the intent directly.
     await stub.makeServerReadyThroughDiscovery("c1-server");
 
     const settledRow = await waitForSettlementSchedule(stub, "c1-intent");
@@ -1373,5 +1527,163 @@ describe("durable MCP settlement watches", () => {
     );
     expect(live).toHaveLength(1);
     expect(live[0].idempotency_key).toBe("shared-key");
+  });
+
+  // Unification: an idempotent retry settles through the SAME arm-then-settle
+  // path as creation. A same-key retry onto an unarmed crash-window intent whose
+  // server already matches must arm a bridging deadline BEFORE the terminal
+  // write — otherwise an eviction in the settle → delivery gap (with no
+  // pre-existing alarm) strands the callback. This is the reuse twin of
+  // "keeps an armed deadline bridging an immediate settle".
+  it("arms a bridging deadline when an idempotent retry immediately settles", async () => {
+    const stub = await settlementAgent("reuse-immediate-bridge");
+    await stub.seedMcpServer(
+      "rib-server",
+      "https://mcp.example.com/rib",
+      MCPConnectionState.READY
+    );
+    // Crash-window: a keyed live intent with a deadline but no armed schedule,
+    // targeting the (already READY) server's URL.
+    await stub.insertKeyedUnarmedDeadlineIntentForTest(
+      "rib-intent",
+      "https://mcp.example.com/rib",
+      60_000,
+      "rib-key"
+    );
+    expect((await stub.getSettlementIntentRows())[0].deadline_schedule_id).toBe(
+      null
+    );
+
+    // Retry with the same key, arming + settling but stopping before delivery.
+    const { created, settled } =
+      await stub.reuseArmSettleWithoutDeliveryForTest(
+        "https://mcp.example.com/rib",
+        "rib-key"
+      );
+    expect(created).toBe(false);
+    expect(settled).toBe(true);
+
+    // Terminal, no delivery scheduled yet…
+    const row = (await stub.getSettlementIntentRows()).find(
+      (r) => r.id === "rib-intent"
+    )!;
+    expect(row.status).toBe("settled");
+    expect(row.delivery_schedule_id).toBeNull();
+    // …but a bridging deadline alarm is armed (the unification fix).
+    expect(row.deadline_schedule_id).toBeTruthy();
+
+    // Recovery (what that alarm triggers on wake) redelivers exactly once.
+    await stub.recoverSettlementIntentsForTest();
+    await waitForSettlementSchedule(stub, "rib-intent");
+    await runDurableObjectAlarm(stub);
+    await runDurableObjectAlarm(stub);
+
+    const results = await stub.getSettlementResults();
+    expect(results).toHaveLength(1);
+    expect(results[0].type).toBe("settled");
+  });
+
+  // Removal of an unarmed crash-window intent: the cancel fast-path settles it
+  // directly as `cancelled` (no skip). Its co-committed alarm — absent in this
+  // simulated row — would otherwise fire once and no-op; correctness never
+  // depended on cancelling that alarm. (A normally-armed intent cancels the same
+  // way and additionally cancels its alarm — covered by "cancels explicit
+  // watches and server-removal watches".)
+  it("cancels an unarmed crash-window intent whose server is removed", async () => {
+    const stub = await settlementAgent("removal-unarmed");
+    await stub.seedMcpServer(
+      "ru-server",
+      "https://mcp.example.com/ru",
+      MCPConnectionState.CONNECTING
+    );
+    // Crash-window: a serverId-targeted live intent with a deadline but no armed
+    // schedule (id never recorded).
+    await stub.insertLiveServerDeadlineIntentWithoutScheduleForTest(
+      "ru-intent",
+      "ru-server",
+      60_000
+    );
+
+    // Remove the server: the cancel fast-path settles the unarmed intent.
+    await stub.removeMcpServerForSettlementTest("ru-server");
+    const rows = await stub.getSettlementIntentRows();
+    expect(rows[0].status).toBe("cancelled");
+    expect(rows[0].deadline_schedule_id).toBeNull();
+
+    const settledRow = await waitForSettlementSchedule(stub, "ru-intent");
+    expect(settledRow.status).toBe("cancelled");
+    await runDurableObjectAlarm(stub);
+
+    const results = await stub.getSettlementResults();
+    expect(results).toHaveLength(1);
+    expect(results[0].type).toBe("cancelled");
+  });
+
+  // FAILED is a default target state ([ready, failed]) but the rest of the suite
+  // only ever drives READY. Prove a watch settles on FAILED too.
+  it("settles on a FAILED server (a default target state)", async () => {
+    const stub = await settlementAgent("failed-settle");
+    await stub.seedMcpServer(
+      "failed-server",
+      "https://mcp.example.com/failed",
+      MCPConnectionState.FAILED
+    );
+
+    const watch = await stub.createSettlementWatchByServerId("failed-server", {
+      deadlineSeconds: 60
+    });
+    expect(watch.created).toBe(true);
+
+    const rows = await stub.getSettlementIntentRows();
+    expect(rows[0].status).toBe("settled");
+
+    await runDurableObjectAlarm(stub);
+
+    const results = await stub.getSettlementResults();
+    expect(results).toHaveLength(1);
+    expect(results[0].type).toBe("settled");
+    if (results[0].type === "settled") {
+      expect(results[0].state).toBe(MCPConnectionState.FAILED);
+    }
+  });
+
+  // Cold-instance replay: recovery must work on a freshly-CONSTRUCTED settlement
+  // store (ensureTable idempotent over the existing table + rows), not only on a
+  // warm instance. The subsystem holds no in-memory state by design, so rebuilding
+  // the store then recovering must still redeliver exactly once.
+  it("recovers a terminal-but-undelivered intent after the store is reconstructed", async () => {
+    const stub = await settlementAgent("cold-reconstruct");
+    await stub.seedMcpServer(
+      "cold-server",
+      "https://mcp.example.com/cold",
+      MCPConnectionState.READY
+    );
+    // Durable pre-eviction state: a live intent (with deadline, unarmed) whose
+    // server already matches — exactly what survives in SQLite across a wake.
+    await stub.insertLiveServerDeadlineIntentWithoutScheduleForTest(
+      "cold-intent",
+      "cold-server",
+      60_000
+    );
+
+    // Discard + rebuild the in-memory store against the existing SQLite.
+    await stub.reconstructSettlementStoreForTest();
+
+    // The rebuilt store still sees the row (ensureTable did not wipe it).
+    let rows = await stub.getSettlementIntentRows();
+    expect(rows).toHaveLength(1);
+    expect(rows[0].status).toBe("live");
+
+    // Recovery on the fresh store re-arms then settles the matching server.
+    await stub.recoverSettlementIntentsForTest();
+    await waitForSettlementSchedule(stub, "cold-intent");
+    await runDurableObjectAlarm(stub);
+    await runDurableObjectAlarm(stub);
+
+    rows = await stub.getSettlementIntentRows();
+    expect(rows[0].status).toBe("settled");
+    const results = await stub.getSettlementResults();
+    expect(results).toHaveLength(1);
+    expect(results[0].type).toBe("settled");
   });
 });

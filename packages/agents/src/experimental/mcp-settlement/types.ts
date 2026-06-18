@@ -99,7 +99,6 @@ export type RegisterMCPSettlementIntentOptions = {
 export type RegisterMCPSettlementIntentResult = {
   intentId: string;
   created: boolean;
-  deliveries: MCPSettlementDelivery[];
 };
 
 export type LiveSettlementDeadline = {

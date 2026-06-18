@@ -20,7 +20,7 @@ import {
 } from "../../mcp/client-connection.ts";
 import type { MCPServerStateChange } from "../../mcp/client.ts";
 import { withMcpSettlement } from "../../experimental/mcp-settlement/index.ts";
-import type { McpSettlementStore } from "../../experimental/mcp-settlement/store.ts";
+import { McpSettlementStore } from "../../experimental/mcp-settlement/store.ts";
 import type {
   MCPServerSettledResult,
   MCPServerSettlementTarget
@@ -1301,9 +1301,8 @@ export class TestMcpSettlementAgent extends withMcpSettlement(Agent) {
   // Run the recovery ordering — re-arm live deadlines FIRST, then re-derive
   // (which settles a matching intent) — but deliberately DO NOT schedule the
   // resulting delivery, simulating an eviction in the settle → delivery gap.
-  // The invariant under test (the P1 fix): the now-terminal intent still has an
-  // armed deadline alarm to bridge that gap (with the old order it would have
-  // settled before any deadline was armed, leaving no alarm).
+  // The invariant under test: the terminal intent still has an armed deadline
+  // alarm to bridge that gap so recovery can redeliver.
   @callable()
   async recoverArmThenRederiveWithoutDeliveryForTest(): Promise<void> {
     const settlement = (this as unknown as { _settlement: McpSettlementStore })
@@ -1334,7 +1333,7 @@ export class TestMcpSettlementAgent extends withMcpSettlement(Agent) {
   }
 
   // Set a connection's state directly WITHOUT firing onServerStateChanged, so a
-  // test can isolate the wake re-derivation path (the P1 post-reconnect re-derive)
+  // test can isolate the wake re-derivation path (the post-reconnect re-derive)
   // from the awake event fast-path. Mirrors a background reconnect that reached
   // READY on a wake where nothing kept the DO alive to emit the in-memory event.
   @callable()
@@ -1360,7 +1359,7 @@ export class TestMcpSettlementAgent extends withMcpSettlement(Agent) {
     )._scheduleDerivedMcpSettlementDeliveries();
   }
 
-  // Reproduce the P1 immediate-settle crash window: register a watch whose
+  // Reproduce the immediate-settle crash window: register a watch whose
   // target already matches, arm the deadline, record the terminal decision —
   // then STOP, simulating an eviction before the delivery schedule lands. The
   // invariant under test is that an armed deadline alarm bridges this gap, so
@@ -1392,6 +1391,61 @@ export class TestMcpSettlementAgent extends withMcpSettlement(Agent) {
     // …then record the terminal decision, but DO NOT schedule the delivery.
     const delivery = settlement.checkSettlementNow(registration.intentId);
     return { intentId: registration.intentId, settled: !!delivery };
+  }
+
+  // Reuse-path variant of `armSettleWithoutDeliveryForTest`: retry onto an
+  // EXISTING live intent (same idempotencyKey) whose server already matches,
+  // arm the deadline, record the terminal decision — then STOP before the
+  // delivery schedule lands. Proves the unified registration path arms a
+  // bridging alarm on reuse too (not just creation), so an eviction in the
+  // settle → delivery gap of an idempotent retry still has an alarm to wake
+  // recovery. Returns whether it reused (created:false) and whether it settled.
+  @callable()
+  async reuseArmSettleWithoutDeliveryForTest(
+    url: string,
+    idempotencyKey: string,
+    deadlineSeconds = 60
+  ): Promise<{ intentId: string; created: boolean; settled: boolean }> {
+    const settlement = (this as unknown as { _settlement: McpSettlementStore })
+      ._settlement;
+    const registration = settlement.registerSettlementIntent(
+      { url },
+      { callback: "onMcpSettlement", deadlineSeconds, idempotencyKey }
+    );
+    // Arm the bridging deadline FIRST (idempotent: a never-armed crash-window
+    // intent is armed; an already-armed one dedupes)…
+    const pending = settlement.getPendingDeadline(registration.intentId);
+    if (pending) {
+      await (
+        this as unknown as {
+          _scheduleMcpSettlementDeadline(d: {
+            intentId: string;
+            deadlineAt: number;
+          }): Promise<void>;
+        }
+      )._scheduleMcpSettlementDeadline(pending);
+    }
+    // …then record the terminal decision, but DO NOT schedule the delivery.
+    const delivery = settlement.checkSettlementNow(registration.intentId);
+    return {
+      created: registration.created,
+      intentId: registration.intentId,
+      settled: !!delivery
+    };
+  }
+
+  // Approximate a cold DO wake: discard the in-memory settlement store and
+  // rebuild it against the existing SQLite (so `ensureTable` runs again over the
+  // already-populated table + indexes, exactly as a freshly-constructed instance
+  // would). The subsystem holds no other in-memory state by design — the durable
+  // guarantee lives in SQLite + cf_agents_schedules — so this exercises the
+  // reconstruct-then-recover path without a real eviction (vitest-pool-workers
+  // exposes no public evict API). Recovery itself is driven separately via
+  // `recoverSettlementIntentsForTest` / an alarm.
+  @callable()
+  async reconstructSettlementStoreForTest(): Promise<void> {
+    (this as unknown as { _settlement: McpSettlementStore })._settlement =
+      McpSettlementStore.create(this, this.mcp);
   }
 
   // Simulate a wake by re-running the framework onStart wrapper, which invokes

@@ -475,14 +475,31 @@ export class MCPClientManager {
     // payload doesn't re-scan `cf_agents_mcp_servers` for every transition of
     // every MCP agent.
     const server = this.getServerFromStorage(serverId);
-    if (!server) return;
+    if (server) {
+      // Fire unconditionally for a registered server — including a downgrade to
+      // a `null` state (closeConnection / failed RPC restore / migration with no
+      // connection). Suppressing the `null` transition would leave awake
+      // subscribers (broadcastMcpServers, a consumer DO's publish) showing a
+      // stale `ready`.
+      this._onServerStateChanged.fire(this._buildServerStateChange(server));
+      return;
+    }
 
-    // Fire unconditionally for a registered server — including a downgrade to a
-    // `null` state (closeConnection / failed RPC restore / migration with no
-    // connection). Suppressing the `null` transition would leave awake
-    // subscribers (broadcastMcpServers, a consumer DO's publish) showing a
-    // stale `ready`.
-    this._onServerStateChanged.fire(this._buildServerStateChange(server));
+    // No stored config row — e.g. the deprecated storage-less `connect()` path,
+    // which creates an in-memory connection without a `cf_agents_mcp_servers`
+    // row. Fall back to the live connection so the public `onServerStateChanged`
+    // event fires for those connections too. Emit nothing only when neither a
+    // row nor a live connection exists. There is no `auth_url` row for a
+    // storage-less connection, so the connection's own `connectionState` is
+    // authoritative (consistent with `_resolveServerState`'s "live state wins").
+    const conn = this.mcpConnections[serverId];
+    if (!conn) return;
+    this._onServerStateChanged.fire({
+      error: conn.connectionError ?? undefined,
+      serverId,
+      state: conn.connectionState ?? null,
+      url: conn.url.toString()
+    });
   }
 
   /**

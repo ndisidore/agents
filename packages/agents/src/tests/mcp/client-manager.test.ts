@@ -2563,6 +2563,43 @@ describe("MCPClientManager OAuth Integration", () => {
       });
     });
 
+    it("fires onServerStateChanged for a storage-less connection (deprecated connect path)", async () => {
+      // The deprecated `connect()` path creates an in-memory connection without
+      // a cf_agents_mcp_servers row. The state-change chokepoint must still fire
+      // the public event for such connections (building the payload from the
+      // live connection), not silently swallow it because storage has no row.
+      const id = "storage-less-server";
+      const url = "http://example.com/mcp";
+      const onStateChangedSpy = vi.fn();
+      manager.onServerStateChanged(onStateChangedSpy);
+
+      // Simulate the connect() path: an in-memory connection, no storage row.
+      const conn = new MCPClientConnection(
+        new URL(url),
+        { name: "test", version: "1.0.0" },
+        { client: {}, transport: { type: "auto" } }
+      );
+      conn.connectionState = "connected" as MCPConnectionState;
+      conn.discover = vi.fn().mockImplementation(async () => {
+        conn.connectionState = "ready" as MCPConnectionState;
+        return { success: true };
+      });
+      manager.mcpConnections[id] = conn;
+
+      // No stored config row exists for this server.
+      expect(manager.listServers().some((s) => s.id === id)).toBe(false);
+
+      // discoverIfConnected() is the notify point on the storage-less path.
+      await manager.discoverIfConnected(id);
+
+      expect(onStateChangedSpy).toHaveBeenCalledTimes(1);
+      expect(onStateChangedSpy.mock.calls[0][0]).toMatchObject({
+        serverId: id,
+        state: "ready",
+        url
+      });
+    });
+
     it("fires onServerRemoved after storage removal, carrying the last-known url", async () => {
       const id = "removed-payload-server";
       const url = "http://example.com/mcp";

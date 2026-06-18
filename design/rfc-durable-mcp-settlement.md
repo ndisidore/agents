@@ -165,12 +165,18 @@ Key invariants:
    (synchronous SQL) lands in the same output gate as the triggering transition.
    Only the follow-up `schedule()` is deferred (anchored with `ctx.waitUntil`).
 2. **An armed alarm always bridges the terminal write and the delivery
-   schedule.** Registration arms the deadline _before_ settling; the deadline
-   handler re-arms a fresh deadline _before_ settling a timeout; and the awake
-   fast-path skips a live intent that has no armed deadline (the registration
-   crash window) and arms it on a durable repair path before settling. So a
-   crash in the settle → delivery gap always leaves an alarm to wake recovery,
-   which replays a terminal-but-undelivered row.
+   schedule.** Registration inserts the intent row and arms its deadline alarm
+   with no `await` between them, so both rows commit in a single Durable Object
+   output gate — a committed live intent therefore always has a committed
+   deadline alarm (only the alarm's id, recorded by a later UPDATE, can be
+   missing after a crash, which costs at most one redundant no-op alarm fire,
+   never a lost timeout). The deadline handler re-arms a fresh deadline _before_
+   settling a timeout, and replays a terminal-but-undelivered row when it fires
+   on an already-awake DO. So a crash in the settle → delivery gap always leaves
+   an alarm that either wakes recovery or, on a warm DO, replays the row
+   directly. This co-commit guarantee requires the intent and schedule rows to
+   share one DO's storage, so the mixin rejects use on a facet/sub-agent (whose
+   schedule rows live in the root DO).
 3. **`deadlineSeconds` is required and integer.** Every watch arms a durable
    deadline alarm, guaranteeing the abandoned-OAuth case resolves and that every
    intent has a self-cleaning terminal path (no leaked live rows). Whole seconds
@@ -194,45 +200,71 @@ Key invariants:
 The SDK already ships a durable-continuation primitive (`runFiber`/`startFiber`,
 the `cf_agents_fibers` + `cf_agents_runs` ledger, `onFiberRecovered`), and a
 settlement watch superficially resembles it: idempotency key, status state
-machine, wake recovery. Could settlement just be a fiber?
+machine, wake recovery. Could settlement just be a fiber? The rejection rests on
+two capabilities settlement needs that fibers do not have:
 
-Not as the fiber primitive exists today. A fiber runs to completion within a
-single awake turn while holding `keepAlive()`; there is no park-until-signal (an
-in-memory `await` is lost on eviction, and recovery re-invokes `onFiberRecovered`
-from a durable snapshot, not the lost closure), and there is no durable
-`deadline → timeout` (only recovery-side age-out knobs that abandon rather than
-fire a result). Settlement is built around exactly the two capabilities fibers
-lack: await-an-external-event across hibernation, and a durable deadline.
+1. **No durable `deadline → timeout`.** The fiber ledgers carry no deadline or
+   expiry — only observational timestamps (created/started/completed). The only
+   alarm fibers arm is the recovery-retry alarm, which re-runs the recovery scan
+   and never delivers a result, and the recovery age-out knob **abandons** an
+   interrupted row rather than firing a terminal `timeout`. A settlement watch's
+   load-bearing case — the abandoned-OAuth `deadline → timeout` with no watcher
+   present — has no analog.
+2. **No park-until-signal.** A fiber body is a single uninterrupted run bracketed
+   by `keepAlive()`, which prevents only _idle_ eviction, not deploys or crashes.
+   An external `await` inside the body is an ordinary in-memory promise lost on
+   eviction. Recovery re-invokes the `onFiberRecovered` _hook_ from a durable
+   snapshot — never the original closure. And `resolveFiber` is not a live-signal
+   seam: it accepts only rows already `interrupted` (i.e. post-eviction), so
+   "external code drives a fiber to a terminal result" is true only _after a
+   crash_, the opposite of what a live state-transition signal needs.
 
-That said, the gap is narrower than "structurally impossible." Fibers already
-recover via a durable snapshot + `onFiberRecovered` hook — the same shape
-settlement uses — and `resolveFiber` already lets external code drive a parked
-fiber to a terminal result. So a `deadlineMs → timeout` column and a
-signal → resolve seam would be more a natural extension of the existing primitive
-than a redesign.
+Closing the gap is not a small extension. Adding park-until-signal would require
+a new durable `parked` status, widening `resolveFiber` beyond its
+`interrupted`-only contract, and a park primitive inside the fiber runner for
+which the framework has no continuation re-entry — effectively re-deriving the
+settlement model (durable intent + scheduled callback + authoritative deadline)
+inside a stable primitive. Adding just the deadline column + alarm is more
+modest, but it is only half the gap.
 
-We ship settlement as a separate experimental subsystem anyway, for reasons of
-scope rather than impossibility:
+Confirmed differences that also argue against unifying:
 
-- **Blast radius.** `cf_agents_fibers` / `runFiber` is stable core; settlement is
-  experimental. Adding a `timeout` status, a deadline column, signal semantics,
-  and a second idempotency model to a stable primitive to serve one experimental
-  consumer is the wrong scope.
+- **Divergent idempotency contract.** A fiber's `idempotency_key` is a full
+  column-level `UNIQUE` (one fiber per key, forever); settlement uses a _partial_
+  unique index over live rows (a key is reusable after the prior watch settles)
+  plus an option-match check on reuse. Unifying would require changing the
+  fiber's constraint.
 - **Domain-specific matching.** Settlement's value is largely in URL-vs-serverId
   resolution, duplicate-URL handling, and `auth_url → AUTHENTICATING`
   derivation — none of which belong in a generic continuation primitive.
-- **Divergent idempotency contract.** A fiber's `idempotency_key` is a full
-  `UNIQUE` column (one fiber per key, forever); settlement uses a _partial_
-  unique index over live rows (a key is reusable after the prior watch settles),
-  plus an option-match check on reuse. Unifying would require changing the
-  fiber's constraint.
+- **Blast radius.** `cf_agents_fibers` / `runFiber` is stable, exported public
+  API; settlement is experimental. Adding a `timeout` status, a deadline column,
+  signal semantics, and a second idempotency model to a stable primitive to serve
+  one experimental consumer is the wrong scope and direction of dependency.
 
-This is known, accepted debt: the SDK now carries several lookalike durable
-ledgers (`cf_agents_fibers`, `cf_agent_tool_runs`,
-`cf_agents_mcp_settlement_intents`) coordinated by `cf_agents_schedules`, and
-chat recovery already rides on fibers. If a unified continuation primitive with
-park-until-signal and a durable deadline ever lands, settlement, chat recovery,
-and agent-tool runs could sit on top of it. Until then they remain distinct.
+This is known, accepted debt: the SDK carries several lookalike durable ledgers
+(`cf_agents_fibers`, `cf_agent_tool_runs`, `cf_agents_mcp_settlement_intents`)
+coordinated by `cf_agents_schedules`. Chat recovery rides on fibers (the
+`__cf_internal_chat_turn` fiber name); agent-tool runs do not — they are a
+separate `cf_agent_tool_runs` subsystem recovered alongside fibers in the wake
+path. If a unified continuation primitive with park-until-signal and a durable
+deadline ever lands, settlement, chat recovery, and agent-tool runs could sit on
+top of it. Until then they remain distinct — and shipping settlement separately
+keeps the experimental blast radius out of the stable fiber primitive.
+
+Capability comparison:
+
+| Capability                                | Fibers today                                                     | Settlement subsystem                                           |
+| ----------------------------------------- | ---------------------------------------------------------------- | -------------------------------------------------------------- |
+| Durable record of in-flight work          | Yes (`cf_agents_runs` + `cf_agents_fibers`)                      | Yes (intent rows)                                              |
+| Idempotency-key dedupe                    | Full `UNIQUE` column (forever)                                   | Partial unique index over _live_ rows (reusable)               |
+| Recovery after crash/deploy eviction      | Yes — `onFiberRecovered` from a durable snapshot                 | Yes — wake re-derivation re-arms + settles                     |
+| Recovery delivery guarantee               | At-least-once via persisted retry alarm                          | At-least-once via `schedule()`                                 |
+| Live return-value delivery                | In-process only (in-memory waiters, lost on eviction)            | N/A — delivery is always the durable scheduled callback        |
+| **Durable `deadline → timeout` result**   | **No** — only recovery age-out that _abandons_                   | **Yes** — required `deadlineSeconds` → authoritative `timeout` |
+| **Park-until-external-signal (live)**     | **No** — external await is an in-memory promise lost on eviction | Yes — the watch is the parked intent                           |
+| External resolution from outside the body | Only on already-`interrupted` (post-eviction) rows               | Yes — any state transition / cancel / timeout settles it       |
+| Stable vs experimental                    | Stable, exported public API                                      | Experimental                                                   |
 
 ### Pure composed watcher (no mixin)
 
